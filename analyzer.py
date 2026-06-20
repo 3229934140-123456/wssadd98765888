@@ -234,7 +234,7 @@ def build_timeline(first_nodes: List[KeyNode],
                    max_nodes: int = 15) -> List[TimelineNode]:
     timeline: List[TimelineNode] = []
 
-    for node in first_nodes[:5]:
+    for idx, node in enumerate(first_nodes[:5]):
         p = node.post
         timeline.append(TimelineNode(
             time_point=p.publish_time,
@@ -242,9 +242,11 @@ def build_timeline(first_nodes: List[KeyNode],
             title=f"@{p.username} · {p.platform.value}",
             description=f"{node.reason} | 互动{p.effective_engagement}",
             related_post=p,
+            review_status=node.review_status,
+            _source_ref=f"first|{idx}",
         ))
 
-    for node in amp_nodes[:8]:
+    for idx, node in enumerate(amp_nodes[:8]):
         p = node.post
         timeline.append(TimelineNode(
             time_point=p.publish_time,
@@ -252,9 +254,11 @@ def build_timeline(first_nodes: List[KeyNode],
             title=f"@{p.username} · {p.platform.value}",
             description=f"{node.reason} | 互动{p.effective_engagement}",
             related_post=p,
+            review_status=node.review_status,
+            _source_ref=f"amp|{idx}",
         ))
 
-    for point in sentiment_points[:5]:
+    for idx, point in enumerate(sentiment_points[:5]):
         neg = point.sentiment_ratio.get("负面", 0)
         if neg > 0.5:
             change = "负面上升"
@@ -268,6 +272,8 @@ def build_timeline(first_nodes: List[KeyNode],
             title=f"正{point.sentiment_ratio.get('正面', 0):.0%}/中{point.sentiment_ratio.get('中性', 0):.0%}/负{neg:.0%}",
             description=point.description,
             sentiment_change=change,
+            review_status=point.review_status,
+            _source_ref=f"sentiment|{idx}",
         ))
 
     timeline.sort(key=lambda t: t.time_point)

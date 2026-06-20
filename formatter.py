@@ -112,11 +112,19 @@ def _print_sentiment_point(point: SentimentTurningPoint, index: int, show_status
     print()
 
 
-def _print_timeline(timeline: list):
+def _print_timeline(timeline: list, filter_excluded: bool = False):
     if not timeline:
         return
 
-    _print_section_title("四、传播时间线", len(timeline))
+    if filter_excluded:
+        filtered = [t for t in timeline if t.review_status != "排除"]
+    else:
+        filtered = list(timeline)
+
+    if not filtered:
+        return
+
+    _print_section_title("四、传播时间线", len(filtered))
 
     type_color = {
         "首发线索": Fore.GREEN,
@@ -124,17 +132,22 @@ def _print_timeline(timeline: list):
         "情绪拐点": Fore.MAGENTA,
     }
 
-    for i, node in enumerate(timeline, 1):
+    for i, node in enumerate(filtered, 1):
         t_color = type_color.get(node.node_type, Fore.WHITE)
         time_str = node.time_point.strftime("%m-%d %H:%M")
+        status_str = ""
+        if node.review_status != "待复核":
+            sc = {"可信": Fore.GREEN, "存疑": Fore.YELLOW, "排除": Fore.RED}.get(node.review_status, "")
+            if sc:
+                status_str = f" [{sc}{node.review_status}{Style.RESET_ALL}]"
 
         if node.node_type == "情绪拐点":
             print(f"  {Fore.LIGHTBLACK_EX}[{time_str}] {t_color}[{node.node_type}] "
-                  f"{Fore.WHITE}{node.title}")
+                  f"{Fore.WHITE}{node.title}{status_str}")
             print(f"      {Fore.LIGHTBLACK_EX}{node.description}")
         else:
             print(f"  {Fore.LIGHTBLACK_EX}[{time_str}] {t_color}[{node.node_type}] "
-                  f"{Fore.WHITE}{node.title}")
+                  f"{Fore.WHITE}{node.title}{status_str}")
             if node.related_post:
                 print(f"      {Fore.LIGHTBLACK_EX}{_truncate_text(node.related_post.content, 60)}")
             print(f"      {Fore.MAGENTA}{node.description}")
@@ -197,24 +210,32 @@ def _build_daily_timeline(timeline: list, filter_excluded: bool = True) -> str:
     if not timeline:
         return ""
 
+    nodes = timeline
+    if filter_excluded:
+        nodes = [t for t in timeline if t.review_status != "排除"]
+
+    if not nodes:
+        return "[传播时间线]\n  暂无有效节点\n"
+
     lines = []
     lines.append("[传播时间线]")
     type_icons = {"首发线索": "起", "放大节点": "扩", "情绪拐点": "情"}
 
     count = 0
-    for node in timeline:
+    for node in nodes:
         if count >= 8:
             break
         icon = type_icons.get(node.node_type, "·")
         time_str = node.time_point.strftime("%m-%d %H:%M")
+        status = f"[{node.review_status}] " if node.review_status != "待复核" else ""
         if node.node_type == "情绪拐点":
-            lines.append(f"  {count+1}. [{time_str}][{icon}] {node.title}")
+            lines.append(f"  {count+1}. [{time_str}][{icon}] {status}{node.title}")
             lines.append(f"     {node.description}")
         else:
             title = node.title
             if len(title) > 40:
                 title = title[:37] + "..."
-            lines.append(f"  {count+1}. [{time_str}][{icon}] {title}")
+            lines.append(f"  {count+1}. [{time_str}][{icon}] {status}{title}")
             desc = node.description
             if len(desc) > 50:
                 desc = desc[:47] + "..."

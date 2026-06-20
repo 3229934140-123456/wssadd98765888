@@ -1,9 +1,11 @@
-from typing import List, Tuple
+import json
+import os
+from typing import List, Tuple, Optional, Dict
 
 from colorama import Fore, Style, init
 
-from models import AnalysisResult, KeyNode, SentimentTurningPoint
-from formatter import _print_key_node, _print_sentiment_point, print_summary_header
+from models import AnalysisResult, KeyNode, SentimentTurningPoint, TimelineNode
+from formatter import _print_key_node, _print_sentiment_point, _build_daily_timeline, _format_num, _truncate_text
 
 init(autoreset=True)
 
@@ -21,6 +23,147 @@ REVIEW_OPTIONS = {
 
 REVIEW_PRIORITY = {"可信": 0, "待复核": 1, "存疑": 2, "排除": 3}
 
+REVIEW_DIR = os.path.join(os.path.expanduser("~"), ".trace_workbench_reviews")
+
+
+def _ensure_review_dir():
+    try:
+        if not os.path.exists(REVIEW_DIR):
+            os.makedirs(REVIEW_DIR, exist_ok=True)
+    except Exception:
+        pass
+
+
+def _safe_event_id(event_id: str) -> str:
+    safe = "".join(c for c in event_id if c.isalnum() or c in ("-", "_"))
+    return safe or "unnamed"
+
+
+def _review_file_path(event_id: str) -> str:
+    _ensure_review_dir()
+    return os.path.join(REVIEW_DIR, f"review_{_safe_event_id(event_id)}.json")
+
+
+def _build_node_key(node: KeyNode) -> str:
+    p = node.post
+    return f"node|{p.platform.value}|{p.username}|{p.publish_time.strftime('%Y%m%d%H%M')}|{hash(p.content[:50]) % 10000:04d}"
+
+
+def _build_sentiment_key(point: SentimentTurningPoint) -> str:
+    return f"sent|{point.time_point.strftime('%Y%m%d%H%M')}|{hash(point.description[:30]) % 10000:04d}"
+
+
+def save_review_session(event_id: str, first_nodes: List[KeyNode],
+                        amp_nodes: List[KeyNode],
+                        sentiment_points: List[SentimentTurningPoint]) -> int:
+    data: Dict = {"version": 1, "nodes": {}, "sentiments": {}}
+    reviewed = 0
+
+    for node in first_nodes:
+        if node.review_status != "待复核":
+            data["nodes"][_build_node_key(node)] = {"status": node.review_status, "reason": ""}
+            reviewed += 1
+    for node in amp_nodes:
+        if node.review_status != "待复核":
+            data["nodes"][_build_node_key(node)] = {"status": node.review_status, "reason": ""}
+            reviewed += 1
+    for point in sentiment_points:
+        if point.review_status != "待复核":
+            data["sentiments"][_build_sentiment_key(point)] = {
+                "status": point.review_status,
+                "reason": getattr(point, 'review_reason', ''),
+            }
+            reviewed += 1
+
+    try:
+        with open(_review_file_path(event_id), "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"  {Fore.YELLOW}警告：保存复核记录失败：{str(e)}{Style.RESET_ALL}")
+
+    return reviewed
+
+
+def load_review_session(event_id: str, first_nodes: List[KeyNode],
+                        amp_nodes: List[KeyNode],
+                        sentiment_points: List[SentimentTurningPoint]) -> int:
+    path = _review_file_path(event_id)
+    if not os.path.exists(path):
+        return 0
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return 0
+
+    applied = 0
+    node_map: Dict[str, dict] = data.get("nodes", {})
+    sent_map: Dict[str, dict] = data.get("sentiments", {})
+
+    for node in first_nodes:
+        key = _build_node_key(node)
+        if key in node_map:
+            node.review_status = node_map[key].get("status", "待复核")
+            applied += 1
+    for node in amp_nodes:
+        key = _build_node_key(node)
+        if key in node_map:
+            node.review_status = node_map[key].get("status", "待复核")
+            applied += 1
+    for point in sentiment_points:
+        key = _build_sentiment_key(point)
+        if key in sent_map:
+            point.review_status = sent_map[key].get("status", "待复核")
+            point.review_reason = sent_map[key].get("reason", "")
+            applied += 1
+
+    return applied
+
+
+def clear_review_session(event_id: str):
+    path = _review_file_path(event_id)
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except Exception:
+        pass
+
+
+def get_review_summary(result: AnalysisResult) -> Dict[str, int]:
+    categories = ["可信", "存疑", "排除", "待复核"]
+    summary = {cat: 0 for cat in categories}
+
+    for nodes in (result.first_post_nodes, result.amplification_nodes):
+        for n in nodes:
+            summary[n.review_status] = summary.get(n.review_status, 0) + 1
+    for p in result.sentiment_turning_points:
+        summary[p.review_status] = summary.get(p.review_status, 0) + 1
+
+    return summary
+
+
+def _sync_timeline_from_nodes(timeline: List[TimelineNode],
+                              first_nodes: List[KeyNode],
+                              amp_nodes: List[KeyNode],
+                              sentiment_points: List[SentimentTurningPoint]):
+    for tnode in timeline:
+        ref = tnode._source_ref
+        if not ref:
+            continue
+        try:
+            kind, idx_str = ref.split("|", 1)
+            idx = int(idx_str)
+        except Exception:
+            continue
+
+        if kind == "first" and idx < len(first_nodes):
+            tnode.review_status = first_nodes[idx].review_status
+        elif kind == "amp" and idx < len(amp_nodes):
+            tnode.review_status = amp_nodes[idx].review_status
+        elif kind == "sentiment" and idx < len(sentiment_points):
+            tnode.review_status = sentiment_points[idx].review_status
+
 
 def _review_one_node(node: KeyNode, index: int, total: int) -> str:
     print(f"\n{Fore.YELLOW}{Style.BRIGHT}--- 复核进度：{index}/{total} ---{Style.RESET_ALL}")
@@ -28,13 +171,15 @@ def _review_one_node(node: KeyNode, index: int, total: int) -> str:
 
     print(f"{Fore.CYAN}操作选项：")
     print(f"  1/k/y → 可信    2/d → 存疑    3/n → 排除    Enter/s → 跳过")
-    print(f"  q → 退出复核")
+    print(f"  w → 保存进度    q → 退出复核")
 
     while True:
         choice = input(f"{Fore.YELLOW}?{Style.RESET_ALL} 请选择：").strip().lower()
 
         if choice == "q":
             return "quit"
+        if choice == "w":
+            return "save"
         if choice in REVIEW_OPTIONS:
             return REVIEW_OPTIONS[choice]
 
@@ -65,18 +210,19 @@ def _review_one_sentiment(point: SentimentTurningPoint, index: int, total: int) 
     if point.trigger_posts:
         print(f"    {Fore.LIGHTBLACK_EX}关联热帖：")
         for tp in point.trigger_posts[:2]:
-            from formatter import _truncate_text
             print(f"      · {tp.platform.value} @{tp.username}: {_truncate_text(tp.content, 50)}")
 
     print(f"\n{Fore.CYAN}操作选项：")
     print(f"  1/k/y → 可信    2/d → 存疑    3/n → 排除    Enter/s → 跳过")
-    print(f"  q → 退出复核")
+    print(f"  w → 保存进度    q → 退出复核")
 
     while True:
         choice = input(f"{Fore.YELLOW}?{Style.RESET_ALL} 请选择：").strip().lower()
 
         if choice == "q":
             return "quit", ""
+        if choice == "w":
+            return "save", ""
         if choice in REVIEW_OPTIONS:
             status = REVIEW_OPTIONS[choice]
             reason = ""
@@ -105,6 +251,10 @@ def _filter_excluded(nodes: List[KeyNode]) -> List[KeyNode]:
 
 def _filter_excluded_sentiment(points: List[SentimentTurningPoint]) -> List[SentimentTurningPoint]:
     return [p for p in points if p.review_status != "排除"]
+
+
+def _filter_excluded_timeline(timeline: List[TimelineNode]) -> List[TimelineNode]:
+    return [t for t in timeline if t.review_status != "排除"]
 
 
 def run_review_mode(result: AnalysisResult, event_id: str) -> AnalysisResult:
@@ -140,9 +290,29 @@ def run_review_mode(result: AnalysisResult, event_id: str) -> AnalysisResult:
     print(f"  {Fore.CYAN}情绪拐点：{sent_count} 个")
     print(f"  {Fore.WHITE}合计：{total} 项{Style.RESET_ALL}\n")
 
-    start = input(f"{Fore.YELLOW}?{Style.RESET_ALL} 按回车开始复核，输入 q 跳过：").strip().lower()
-    if start == "q":
-        return result
+    applied = load_review_session(event_id, result.first_post_nodes,
+                                  result.amplification_nodes,
+                                  result.sentiment_turning_points)
+    if applied > 0:
+        remaining = total - sum(
+            1 for _, _, item in all_items if item.review_status != "待复核"
+        )
+        print(f"{Fore.GREEN}发现历史复核记录，已恢复 {applied} 项标记，剩余 {remaining} 项待复核{Style.RESET_ALL}")
+        print()
+        action = input(f"{Fore.YELLOW}?{Style.RESET_ALL} [c]继续剩余  [r]重置从头开始  [a]放弃复核: ").strip().lower()
+        if action == "r":
+            for _, _, item in all_items:
+                item.review_status = "待复核"
+                if hasattr(item, 'review_reason'):
+                    item.review_reason = ""
+            clear_review_session(event_id)
+            print(f"{Fore.YELLOW}已重置复核进度{Style.RESET_ALL}")
+        elif action == "a":
+            return result
+    else:
+        start = input(f"{Fore.YELLOW}?{Style.RESET_ALL} 按回车开始复核，输入 q 跳过：").strip().lower()
+        if start == "q":
+            return result
 
     reviewed_count = 0
     quit_flag = False
@@ -151,30 +321,62 @@ def run_review_mode(result: AnalysisResult, event_id: str) -> AnalysisResult:
         if quit_flag:
             break
 
+        if item.review_status != "待复核":
+            continue
+
+        save_now = False
+
         if item_type == "node":
             status = _review_one_node(item, i, total)
             if status == "quit":
                 quit_flag = True
                 continue
-            if status == "跳过":
-                continue
-            item.review_status = status
+            if status == "save":
+                save_now = True
+                status = None
+            if status == "跳过" or status is None:
+                pass
+            else:
+                item.review_status = status
+                reviewed_count += 1
         else:
             status, reason = _review_one_sentiment(item, i, total)
             if status == "quit":
                 quit_flag = True
                 continue
-            if status == "跳过":
-                continue
-            item.review_status = status
-            item.review_reason = reason
+            if status == "save":
+                save_now = True
+                status = None
+            if status == "跳过" or status is None:
+                pass
+            else:
+                item.review_status = status
+                item.review_reason = reason
+                reviewed_count += 1
 
-        reviewed_count += 1
+        if save_now:
+            saved = save_review_session(event_id, result.first_post_nodes,
+                                        result.amplification_nodes,
+                                        result.sentiment_turning_points)
+            print(f"  {Fore.GREEN}进度已保存（已标记 {saved} 条）{Style.RESET_ALL}")
+            i -= 1
+            continue
+
+        if reviewed_count % 5 == 0 and reviewed_count > 0:
+            save_review_session(event_id, result.first_post_nodes,
+                                result.amplification_nodes,
+                                result.sentiment_turning_points)
+
+    final_saved = save_review_session(event_id, result.first_post_nodes,
+                                      result.amplification_nodes,
+                                      result.sentiment_turning_points)
 
     if quit_flag:
-        print(f"\n{Fore.YELLOW}已退出复核模式，已标记 {reviewed_count} 条{Style.RESET_ALL}")
+        print(f"\n{Fore.YELLOW}已退出复核模式，本会话新增标记 {reviewed_count} 条，"
+              f"合计已标记 {final_saved} 条，进度已保存{Style.RESET_ALL}")
     else:
-        print(f"\n{Fore.GREEN}复核完成，共标记 {reviewed_count} 条{Style.RESET_ALL}")
+        print(f"\n{Fore.GREEN}复核完成，共标记 {final_saved} 条，进度已保存{Style.RESET_ALL}")
+        clear_review_session(event_id)
 
     first_nodes = [item for _, cat, item in all_items if cat == "first"]
     amp_nodes = [item for _, cat, item in all_items if cat == "amp"]
@@ -184,14 +386,21 @@ def run_review_mode(result: AnalysisResult, event_id: str) -> AnalysisResult:
     amp_nodes_sorted = _sort_key_nodes(amp_nodes)
     sentiment_sorted = _sort_sentiment_points(sentiment_points)
 
+    timeline = getattr(result, 'timeline', [])
+    if timeline:
+        _sync_timeline_from_nodes(timeline, first_nodes_sorted, amp_nodes_sorted, sentiment_sorted)
+
     new_result = AnalysisResult(
         first_post_nodes=first_nodes_sorted,
         amplification_nodes=amp_nodes_sorted,
         sentiment_turning_points=sentiment_sorted,
+        timeline=timeline,
         total_posts=result.total_posts,
         time_range=result.time_range,
         data_source=result.data_source,
         source_file=result.source_file,
+        engagement_caliber=getattr(result, 'engagement_caliber', "分字段统计"),
+        import_stats=getattr(result, 'import_stats', []),
     )
 
     _print_reviewed_report(new_result, event_id)
@@ -200,14 +409,20 @@ def run_review_mode(result: AnalysisResult, event_id: str) -> AnalysisResult:
 
 
 def get_trusted_result(result: AnalysisResult) -> AnalysisResult:
+    timeline = getattr(result, 'timeline', [])
+    filtered_timeline = _filter_excluded_timeline(timeline) if timeline else []
+
     return AnalysisResult(
         first_post_nodes=_filter_excluded(result.first_post_nodes),
         amplification_nodes=_filter_excluded(result.amplification_nodes),
         sentiment_turning_points=_filter_excluded_sentiment(result.sentiment_turning_points),
+        timeline=filtered_timeline,
         total_posts=result.total_posts,
         time_range=result.time_range,
         data_source=result.data_source,
         source_file=result.source_file,
+        engagement_caliber=getattr(result, 'engagement_caliber', "分字段统计"),
+        import_stats=getattr(result, 'import_stats', []),
     )
 
 
@@ -217,48 +432,34 @@ def _print_reviewed_report(result: AnalysisResult, event_id: str):
     print(f"{Fore.CYAN}{Style.BRIGHT}{'=' * 60}")
     print(f"{Fore.LIGHTBLACK_EX}  事件编号：{event_id}")
     print(f"{Fore.LIGHTBLACK_EX}  时间范围：{result.time_range}")
+    print(f"{Fore.LIGHTBLACK_EX}  互动量口径：{getattr(result, 'engagement_caliber', '分字段统计')}")
     print(f"{Fore.CYAN}{'-' * 60}{Style.RESET_ALL}\n")
+
+    summary = get_review_summary(result)
+
+    print(f"{Fore.WHITE}{Style.BRIGHT}> 复核统计汇总{Style.RESET_ALL}")
+    print(f"  {Fore.GREEN}可信：{summary.get('可信', 0)}{Style.RESET_ALL}"
+          f"  {Fore.YELLOW}存疑：{summary.get('存疑', 0)}{Style.RESET_ALL}"
+          f"  {Fore.RED}排除：{summary.get('排除', 0)}{Style.RESET_ALL}"
+          f"  {Fore.LIGHTBLACK_EX}待复核：{summary.get('待复核', 0)}{Style.RESET_ALL}")
+    print()
 
     first_trusted = [n for n in result.first_post_nodes if n.review_status == "可信"]
     first_doubt = [n for n in result.first_post_nodes if n.review_status == "存疑"]
     first_excluded = [n for n in result.first_post_nodes if n.review_status == "排除"]
-    first_pending = [n for n in result.first_post_nodes if n.review_status == "待复核"]
 
     amp_trusted = [n for n in result.amplification_nodes if n.review_status == "可信"]
     amp_doubt = [n for n in result.amplification_nodes if n.review_status == "存疑"]
     amp_excluded = [n for n in result.amplification_nodes if n.review_status == "排除"]
-    amp_pending = [n for n in result.amplification_nodes if n.review_status == "待复核"]
 
     sent_trusted = [p for p in result.sentiment_turning_points if p.review_status == "可信"]
     sent_doubt = [p for p in result.sentiment_turning_points if p.review_status == "存疑"]
     sent_excluded = [p for p in result.sentiment_turning_points if p.review_status == "排除"]
-    sent_pending = [p for p in result.sentiment_turning_points if p.review_status == "待复核"]
-
-    print(f"{Fore.WHITE}首发线索：{Style.RESET_ALL}", end="")
-    print(f"  {Fore.GREEN}可信 {len(first_trusted)}{Style.RESET_ALL}"
-          f"  {Fore.YELLOW}存疑 {len(first_doubt)}{Style.RESET_ALL}"
-          f"  {Fore.RED}排除 {len(first_excluded)}{Style.RESET_ALL}"
-          f"  {Fore.LIGHTBLACK_EX}待复核 {len(first_pending)}{Style.RESET_ALL}")
-
-    print(f"{Fore.WHITE}传播节点：{Style.RESET_ALL}", end="")
-    print(f"  {Fore.GREEN}可信 {len(amp_trusted)}{Style.RESET_ALL}"
-          f"  {Fore.YELLOW}存疑 {len(amp_doubt)}{Style.RESET_ALL}"
-          f"  {Fore.RED}排除 {len(amp_excluded)}{Style.RESET_ALL}"
-          f"  {Fore.LIGHTBLACK_EX}待复核 {len(amp_pending)}{Style.RESET_ALL}")
-
-    print(f"{Fore.WHITE}情绪拐点：{Style.RESET_ALL}", end="")
-    print(f"  {Fore.GREEN}可信 {len(sent_trusted)}{Style.RESET_ALL}"
-          f"  {Fore.YELLOW}存疑 {len(sent_doubt)}{Style.RESET_ALL}"
-          f"  {Fore.RED}排除 {len(sent_excluded)}{Style.RESET_ALL}"
-          f"  {Fore.LIGHTBLACK_EX}待复核 {len(sent_pending)}{Style.RESET_ALL}")
-
-    print()
 
     if first_trusted:
         print(f"\n{Fore.GREEN}{Style.BRIGHT}> 可信首发线索 Top{min(3, len(first_trusted))}{Style.RESET_ALL}")
         for i, node in enumerate(first_trusted[:3], 1):
             p = node.post
-            from formatter import _truncate_text
             print(f"  {i}. [{p.publish_time.strftime('%m-%d %H:%M')}] {p.platform.value} @{p.username}")
             print(f"     {_truncate_text(p.content, 45)}")
 
@@ -266,9 +467,13 @@ def _print_reviewed_report(result: AnalysisResult, event_id: str):
         print(f"\n{Fore.GREEN}{Style.BRIGHT}> 可信传播节点 Top{min(3, len(amp_trusted))}{Style.RESET_ALL}")
         for i, node in enumerate(amp_trusted[:3], 1):
             p = node.post
-            from formatter import _truncate_text
             print(f"  {i}. [{p.publish_time.strftime('%m-%d %H:%M')}] {p.platform.value} @{p.username}")
-            print(f"     转{p.repost_count} 评{p.comment_count} 赞{p.like_count}")
+            if p.total_engagement is not None and p.total_engagement > 0 \
+                    and p.repost_count == 0 and p.comment_count == 0 \
+                    and p.like_count == 0 and p.share_count == 0:
+                print(f"     总互动量：{_format_num(p.total_engagement)}")
+            else:
+                print(f"     转{p.repost_count} 评{p.comment_count} 赞{p.like_count}")
             print(f"     {_truncate_text(p.content, 45)}")
 
     if sent_trusted:
@@ -277,8 +482,16 @@ def _print_reviewed_report(result: AnalysisResult, event_id: str):
             neg = point.sentiment_ratio["负面"] * 100
             print(f"  {i}. [{point.time_point.strftime('%m-%d %H:%M')}] 负面{neg:.0f}% - {point.description[:30]}")
 
-    if first_excluded or amp_excluded or sent_excluded:
-        total_excluded = len(first_excluded) + len(amp_excluded) + len(sent_excluded)
+    timeline = getattr(result, 'timeline', [])
+    timeline_filtered = _filter_excluded_timeline(timeline)
+    if timeline_filtered:
+        print(f"\n{Fore.CYAN}{Style.BRIGHT}> 传播时间线（过滤排除项，{len(timeline_filtered)}个节点）{Style.RESET_ALL}")
+        daily_tl = _build_daily_timeline(timeline_filtered, filter_excluded=True)
+        for line in daily_tl.split("\n"):
+            print(f"  {line}")
+
+    total_excluded = len(first_excluded) + len(amp_excluded) + len(sent_excluded)
+    if total_excluded > 0:
         print(f"\n{Fore.LIGHTBLACK_EX}({total_excluded} 项已排除，不纳入最终简报){Style.RESET_ALL}")
 
     print(f"\n{Fore.CYAN}{'=' * 60}{Style.RESET_ALL}\n")

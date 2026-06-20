@@ -71,6 +71,8 @@ class TimelineNode:
     description: str
     related_post: Optional[Post] = None
     sentiment_change: Optional[str] = None
+    review_status: str = "待复核"
+    _source_ref: Optional[str] = None
 
 
 @dataclass

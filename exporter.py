@@ -63,17 +63,33 @@ def _generate_filename(event_id: str, suffix: str, ext: str) -> str:
     return f"TRACE_{safe_event_id}_{suffix}_{timestamp}.{ext}"
 
 
-def _generate_timeline_text(timeline: list, indent: str = "    ") -> list:
+def _generate_timeline_text(timeline: list, indent: str = "    ",
+                            filter_excluded: bool = False) -> list:
     lines = []
     if not timeline:
         return lines
+
+    nodes = [t for t in timeline if not (filter_excluded and t.review_status == "排除")]
+    if not nodes:
+        lines.append(f"{indent}（暂无有效节点）")
+        return lines
+
     type_icons = {"首发线索": "[起]", "放大节点": "[扩]", "情绪拐点": "[情]"}
-    for i, node in enumerate(timeline, 1):
+    for i, node in enumerate(nodes, 1):
         icon = type_icons.get(node.node_type, "[·]")
         time_str = node.time_point.strftime("%m-%d %H:%M")
-        lines.append(f"{indent}{i}. [{time_str}]{icon} {node.title}")
+        status = f" [{node.review_status}]" if node.review_status != "待复核" else ""
+        lines.append(f"{indent}{i}. [{time_str}]{icon} {node.title}{status}")
         lines.append(f"{indent}   {node.description}")
     return lines
+
+
+def _calc_review_summary(result: AnalysisResult) -> dict:
+    from reviewer import get_review_summary
+    try:
+        return get_review_summary(result)
+    except Exception:
+        return {}
 
 
 def _generate_full_report_text(result: AnalysisResult, event_id: str, filter_excluded: bool = False) -> str:
@@ -87,8 +103,19 @@ def _generate_full_report_text(result: AnalysisResult, event_id: str, filter_exc
     lines.append(f"  数据来源：{result.data_source.value}")
     if result.source_file:
         lines.append(f"  来源文件：{result.source_file}")
-    if hasattr(result, 'engagement_caliber'):
-        lines.append(f"  互动量口径：{result.engagement_caliber}")
+
+    engagement_caliber = getattr(result, 'engagement_caliber', "分字段统计")
+    lines.append(f"  互动量口径：{engagement_caliber}")
+
+    rev_summary = _calc_review_summary(result)
+    if rev_summary and sum(rev_summary.values()) > 0:
+        stats_parts = []
+        for k, v in rev_summary.items():
+            if v > 0:
+                stats_parts.append(f"{k} {v}")
+        if stats_parts:
+            lines.append(f"  复核状态：{' / '.join(stats_parts)}")
+
     lines.append(f"  生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     lines.append("-" * 60)
     lines.append("")
@@ -171,12 +198,13 @@ def _generate_full_report_text(result: AnalysisResult, event_id: str, filter_exc
                 lines.append(f"      · {tp.platform.value} @{tp.username}: {_truncate_text(tp.content, 60)}")
         lines.append("")
 
+    timeline_count = len([t for t in timeline if not (filter_excluded and t.review_status == "排除")])
     if timeline:
         lines.append("-" * 56)
-        lines.append(f"  四、传播时间线  ({len(timeline)}个节点)")
+        lines.append(f"  四、传播时间线  ({timeline_count}个节点)")
         lines.append("-" * 56)
         lines.append("")
-        lines.extend(_generate_timeline_text(timeline))
+        lines.extend(_generate_timeline_text(timeline, filter_excluded=filter_excluded))
         lines.append("")
 
     excluded_count = (
@@ -210,8 +238,15 @@ def _generate_full_report_markdown(result: AnalysisResult, event_id: str, filter
     lines.append(f"| 数据来源 | {result.data_source.value} |")
     if result.source_file:
         lines.append(f"| 来源文件 | {result.source_file} |")
-    if hasattr(result, 'engagement_caliber'):
-        lines.append(f"| 互动量口径 | {result.engagement_caliber} |")
+
+    engagement_caliber = getattr(result, 'engagement_caliber', "分字段统计")
+    lines.append(f"| 互动量口径 | {engagement_caliber} |")
+
+    rev_summary = _calc_review_summary(result)
+    if rev_summary and sum(rev_summary.values()) > 0:
+        stats_str = " / ".join(f"{k} {v}" for k, v in rev_summary.items() if v > 0)
+        lines.append(f"| 复核统计 | {stats_str} |")
+
     lines.append(f"| 生成时间 | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} |")
     lines.append("")
 
@@ -306,15 +341,17 @@ def _generate_full_report_markdown(result: AnalysisResult, event_id: str, filter
                 lines.append(f"  - {tp.platform.value} @{tp.username}: {_truncate_text(tp.content, 80)}")
         lines.append("")
 
+    timeline_filtered = [t for t in timeline if not (filter_excluded and t.review_status == "排除")]
     if timeline:
         lines.append("## 四、传播时间线")
-        lines.append(f"共 **{len(timeline)}** 个节点")
+        lines.append(f"共 **{len(timeline_filtered)}** 个节点")
         lines.append("")
         type_icons = {"首发线索": "🌱", "放大节点": "📣", "情绪拐点": "📊"}
-        for i, node in enumerate(timeline, 1):
+        for i, node in enumerate(timeline_filtered, 1):
             icon = type_icons.get(node.node_type, "•")
             time_str = node.time_point.strftime("%m-%d %H:%M")
-            lines.append(f"**{i}. {icon} [{time_str}] {node.node_type}：{node.title}**")
+            status = f" `[{node.review_status}]`" if node.review_status != "待复核" else ""
+            lines.append(f"**{i}. {icon} [{time_str}] {node.node_type}：{node.title}**{status}")
             lines.append("")
             lines.append(f"> {node.description}")
             lines.append("")
@@ -344,11 +381,22 @@ def _generate_daily_text(result: AnalysisResult, event_id: str, filter_excluded:
 def _generate_daily_markdown(result: AnalysisResult, event_id: str, filter_excluded: bool = True) -> str:
     from formatter import print_report_for_daily
     daily_text = print_report_for_daily(result, event_id, filter_excluded=filter_excluded)
+    engagement_caliber = getattr(result, 'engagement_caliber', "分字段统计")
+
+    rev_summary = _calc_review_summary(result)
+
     lines = ["# 舆情溯源日报简报", ""]
     lines.append(f"**事件编号**：{event_id}")
     lines.append(f"**生成时间**：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append(f"**互动量口径**：{engagement_caliber}")
+
+    if rev_summary and sum(rev_summary.values()) > 0:
+        stats_str = " / ".join(f"**{k}** {v}" for k, v in rev_summary.items() if v > 0)
+        lines.append(f"**复核统计**：{stats_str}")
     lines.append("")
-    lines.append("```")
+    lines.append("---")
+    lines.append("")
+    lines.append("```text")
     lines.append(daily_text)
     lines.append("```")
     lines.append("")

@@ -244,12 +244,13 @@ def _content_similar(a: str, b: str, threshold: float = 0.85) -> bool:
     return ratio >= threshold
 
 
-def _dedup_posts(posts: List[Post]) -> Tuple[List[Post], int]:
+def _dedup_posts(posts: List[Post]) -> Tuple[List[Post], int, set]:
     if not posts:
-        return [], 0
+        return [], 0, set()
 
     seen: Dict[str, Post] = {}
     duplicate_count = 0
+    dup_ids: set = set()
 
     sorted_posts = sorted(posts, key=lambda p: (
         p.platform.value,
@@ -263,6 +264,7 @@ def _dedup_posts(posts: List[Post]) -> Tuple[List[Post], int]:
 
         if exact_key in seen:
             duplicate_count += 1
+            dup_ids.add(post.post_id)
             continue
 
         is_dup = False
@@ -277,13 +279,14 @@ def _dedup_posts(posts: List[Post]) -> Tuple[List[Post], int]:
             if _content_similar(existing.content, post.content):
                 is_dup = True
                 duplicate_count += 1
+                dup_ids.add(post.post_id)
                 break
 
         if not is_dup:
             seen[exact_key] = post
 
     result = sorted(seen.values(), key=lambda p: p.publish_time)
-    return result, duplicate_count
+    return result, duplicate_count, dup_ids
 
 
 def _filter_posts(posts: List[Post], config: TraceConfig) -> Tuple[List[Post], int]:
@@ -495,7 +498,8 @@ def _expand_file_pattern(pattern: str) -> List[str]:
 
 
 def _print_import_summary(all_stats: List[ImportStats], total_duplicates: int,
-                          final_count: int, has_total_engagement: bool):
+                          final_count: int, has_total_engagement: bool,
+                          dup_source_ranking: Optional[List[Tuple[str, int]]] = None):
     print(f"\n{Fore.CYAN}{Style.BRIGHT}{'=' * 60}")
     print(f"{Fore.CYAN}{Style.BRIGHT}  批量导入统计汇总")
     print(f"{Fore.CYAN}{Style.BRIGHT}{'=' * 60}{Style.RESET_ALL}\n")
@@ -504,19 +508,34 @@ def _print_import_summary(all_stats: List[ImportStats], total_duplicates: int,
     grand_success = sum(s.success_count for s in all_stats)
     grand_failed = sum(s.failed_count for s in all_stats)
     grand_filtered = sum(s.filtered_count for s in all_stats)
+    grand_dup = sum(s.duplicate_count for s in all_stats)
 
-    print(f"  {'文件':<30} {'总数':>6} {'成功':>6} {'失败':>6} {'过滤':>6}")
-    print(f"  {'-' * 56}")
+    print(f"  {'文件':<28} {'总数':>5} {'成功':>5} {'失败':>5} {'过滤':>5} {'重复':>5}")
+    print(f"  {'-' * 58}")
     for s in all_stats:
         fname = os.path.basename(s.file_path)
-        if len(fname) > 28:
-            fname = fname[:25] + "..."
-        print(f"  {fname:<30} {s.total_count:>6} {s.success_count:>6} {s.failed_count:>6} {s.filtered_count:>6}")
-    print(f"  {'-' * 56}")
-    print(f"  {'合计':<30} {grand_total:>6} {grand_success:>6} {grand_failed:>6} {grand_filtered:>6}")
-    print(f"  {'去重剔除':<30} {'':>6} {total_duplicates:>6}")
-    print(f"  {'最终样本数':<30} {'':>6} {final_count:>6}")
+        if len(fname) > 26:
+            fname = fname[:23] + "..."
+        dup_color = Fore.YELLOW if s.duplicate_count > 0 else ""
+        dup_reset = Style.RESET_ALL if s.duplicate_count > 0 else ""
+        print(f"  {fname:<28} {s.total_count:>5} {s.success_count:>5} "
+              f"{s.failed_count:>5} {s.filtered_count:>5} "
+              f"{dup_color}{s.duplicate_count:>5}{dup_reset}")
+    print(f"  {'-' * 58}")
+    print(f"  {'合计':<28} {grand_total:>5} {grand_success:>5} "
+          f"{grand_failed:>5} {grand_filtered:>5} {grand_dup:>5}")
+    print(f"  {'去重后最终样本数':<28} {'':>5} {final_count:>5}")
     print()
+
+    if dup_source_ranking and grand_dup > 0:
+        print(f"{Fore.YELLOW}{Style.BRIGHT}  重复来源 Top 文件：{Style.RESET_ALL}")
+        for fname, cnt in dup_source_ranking[:3]:
+            pct = (cnt / grand_dup * 100) if grand_dup > 0 else 0
+            print(f"    {Fore.LIGHTBLACK_EX}· {fname}: {cnt} 条重复（占 {pct:.0f}%）{Style.RESET_ALL}")
+        print()
+        print(f"  {Fore.LIGHTBLACK_EX}提示：可优先清理重复来源较多的样本文件{Style.RESET_ALL}")
+        print()
+
     if has_total_engagement:
         print(f"  {Fore.YELLOW}互动量口径：总互动量（单列合并统计）{Style.RESET_ALL}")
     else:
@@ -530,6 +549,8 @@ def load_batch_files(file_paths: List[str], config: TraceConfig) -> Tuple[
     all_posts: List[Post] = []
     all_stats: List[ImportStats] = []
     has_total_engagement = False
+
+    prefix_to_stat: Dict[str, ImportStats] = {}
 
     for i, fp in enumerate(file_paths, 1):
         ext = os.path.splitext(fp)[1].lower()
@@ -545,6 +566,8 @@ def load_batch_files(file_paths: List[str], config: TraceConfig) -> Tuple[
             print(f"{Fore.YELLOW}  跳过不支持的文件类型：{ext}{Style.RESET_ALL}")
             continue
 
+        prefix_to_stat[prefix] = stats
+
         print(f"  {Fore.GREEN}{msg}{Style.RESET_ALL}")
         all_posts.extend(posts)
         all_stats.append(stats)
@@ -553,9 +576,26 @@ def load_batch_files(file_paths: List[str], config: TraceConfig) -> Tuple[
             if any(p.total_engagement is not None and p.total_engagement > 0 for p in posts):
                 has_total_engagement = True
 
-    deduped_posts, dup_count = _dedup_posts(all_posts)
+    deduped_posts, dup_count, dup_ids = _dedup_posts(all_posts)
 
-    _print_import_summary(all_stats, dup_count, len(deduped_posts), has_total_engagement)
+    for pid in dup_ids:
+        try:
+            prefix = pid.split("-", 1)[0]
+            if prefix in prefix_to_stat:
+                prefix_to_stat[prefix].duplicate_count += 1
+        except Exception:
+            pass
+
+    dup_ranking = []
+    if dup_count > 0:
+        dup_ranking = sorted(
+            ((os.path.basename(s.file_path), s.duplicate_count) for s in all_stats),
+            key=lambda x: -x[1],
+        )
+        dup_ranking = [(f, c) for f, c in dup_ranking if c > 0]
+
+    _print_import_summary(all_stats, dup_count, len(deduped_posts),
+                          has_total_engagement, dup_source_ranking=dup_ranking)
 
     source_files = ", ".join(os.path.basename(fp) for fp in file_paths[:3])
     if len(file_paths) > 3:

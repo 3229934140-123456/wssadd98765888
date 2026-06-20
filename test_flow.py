@@ -199,9 +199,10 @@ def test_deduplication():
 
     all_posts = posts1 + posts2
 
-    deduped, dup_count = _dedup_posts(all_posts)
+    deduped, dup_count, dup_ids = _dedup_posts(all_posts)
 
     assert dup_count >= 0, "去重计数不应为负"
+    assert len(dup_ids) == dup_count, "dup_ids数量应和dup_count一致"
     assert len(deduped) + dup_count >= len(all_posts) or True, "去重逻辑正常"
 
     print(f"  合并{len(all_posts)}条，去重后{len(deduped)}条，剔除重复{dup_count}条")
@@ -451,6 +452,237 @@ def test_full_flow():
     return True
 
 
+def test_timeline_filtering():
+    print(f"\n{Fore.CYAN}{Style.BRIGHT}{'=' * 60}")
+    print(f"{Fore.CYAN}{Style.BRIGHT}  测试 13：时间线排除节点过滤")
+    print(f"{Fore.CYAN}{Style.BRIGHT}{'=' * 60}{Style.RESET_ALL}\n")
+
+    from data_loader import load_csv
+    from analyzer import run_analysis
+    from reviewer import get_trusted_result
+    from formatter import print_report_for_daily, _build_daily_timeline
+
+    config = _make_config()
+    config.exclude_words = []
+
+    posts, _, stats = load_csv("sample_data.csv", config)
+    result = run_analysis(posts, config, import_stats=[stats])
+
+    assert len(result.timeline) > 0, "应产生时间线"
+    total_tl = len(result.timeline)
+
+    excluded_count = 0
+    for idx, tnode in enumerate(result.timeline):
+        if idx == 0 or idx == 2:
+            tnode.review_status = "排除"
+            excluded_count += 1
+
+    filtered_tl = [t for t in result.timeline if t.review_status != "排除"]
+    assert len(filtered_tl) == total_tl - excluded_count, "时间线过滤数量应正确"
+
+    trusted = get_trusted_result(result)
+    assert len(trusted.timeline) == total_tl - excluded_count, \
+        f"get_trusted_result 时间线过滤错误：{len(trusted.timeline)} vs {total_tl - excluded_count}"
+
+    daily = print_report_for_daily(result, config.event_id, filter_excluded=True)
+    assert "[传播时间线]" in daily
+
+    tl_text = _build_daily_timeline(result.timeline, filter_excluded=True)
+    assert tl_text, "过滤后时间线文本应能生成"
+
+    print(f"  原始时间线：{total_tl} 个节点")
+    print(f"  标记排除：{excluded_count} 个")
+    print(f"  过滤后：{len(filtered_tl)} 个节点")
+    print(f"  {PASS} 时间线排除节点过滤正常")
+    return True
+
+
+def test_engagement_caliber_persistence():
+    print(f"\n{Fore.CYAN}{Style.BRIGHT}{'=' * 60}")
+    print(f"{Fore.CYAN}{Style.BRIGHT}  测试 14：互动口径全链路持久化")
+    print(f"{Fore.CYAN}{Style.BRIGHT}{'=' * 60}{Style.RESET_ALL}\n")
+
+    from data_loader import load_csv
+    from analyzer import run_analysis
+    from reviewer import get_trusted_result
+    from exporter import (
+        _generate_full_report_text,
+        _generate_full_report_markdown,
+        _generate_daily_text,
+        _generate_daily_markdown,
+    )
+
+    config = _make_config()
+    config.exclude_words = []
+    config.keywords = ["产品", "质量"]
+    config.start_time = datetime(2026, 6, 20, 0, 0)
+    config.end_time = datetime(2026, 6, 21, 0, 0)
+
+    posts, _, stats = load_csv("sample_engagement.csv", config)
+    assert len(posts) > 0, "sample_engagement.csv 应能导入"
+
+    has_te = any(p.total_engagement is not None and p.total_engagement > 0 for p in posts)
+    assert has_te, "sample_engagement.csv 应有 total_engagement 字段"
+
+    result = run_analysis(
+        posts, config,
+        has_total_engagement=True,
+        import_stats=[stats],
+    )
+
+    assert "总互动量" in result.engagement_caliber, \
+        f"初始口径应为总互动量：{result.engagement_caliber}"
+
+    result.first_post_nodes[0].review_status = "可信"
+    result.first_post_nodes[-1].review_status = "排除"
+
+    trusted = get_trusted_result(result)
+    assert "总互动量" in trusted.engagement_caliber, \
+        f"get_trusted_result 后口径丢失：{trusted.engagement_caliber}"
+
+    full_txt = _generate_full_report_text(result, config.event_id, filter_excluded=True)
+    assert "总互动量" in full_txt, "TXT完整报告应包含互动量口径"
+
+    full_md = _generate_full_report_markdown(result, config.event_id, filter_excluded=True)
+    assert "总互动量" in full_md, "Markdown完整报告应包含互动量口径"
+
+    daily_txt = _generate_daily_text(result, config.event_id, filter_excluded=True)
+    assert "总互动量" in daily_txt, "TXT日报应包含互动量口径"
+
+    daily_md = _generate_daily_markdown(result, config.event_id, filter_excluded=True)
+    assert "总互动量" in daily_md, "Markdown日报应包含互动量口径"
+
+    print(f"  初始口径：{result.engagement_caliber}")
+    print(f"  过滤后：{trusted.engagement_caliber}")
+    print(f"  TXT报告/MD报告/日报TXT/日报MD：均包含口径")
+    print(f"  {PASS} 互动量口径全链路持久化正常")
+    return True
+
+
+def test_review_persistence():
+    print(f"\n{Fore.CYAN}{Style.BRIGHT}{'=' * 60}")
+    print(f"{Fore.CYAN}{Style.BRIGHT}  测试 15：复核记录保存/恢复")
+    print(f"{Fore.CYAN}{Style.BRIGHT}{'=' * 60}{Style.RESET_ALL}\n")
+
+    from data_loader import load_csv
+    from analyzer import run_analysis
+    from reviewer import (
+        save_review_session,
+        load_review_session,
+        clear_review_session,
+        get_review_summary,
+    )
+
+    config = _make_config()
+    config.exclude_words = []
+    test_event_id = "TEST-PERSIST-001"
+
+    posts, _, stats = load_csv("sample_data.csv", config)
+    result = run_analysis(posts, config, import_stats=[stats])
+
+    clear_review_session(test_event_id)
+
+    assert len(result.first_post_nodes) >= 3, "需要至少3条首发进行测试"
+    assert len(result.amplification_nodes) >= 3, "需要至少3条传播进行测试"
+
+    result.first_post_nodes[0].review_status = "可信"
+    result.first_post_nodes[1].review_status = "存疑"
+    result.first_post_nodes[2].review_status = "排除"
+    result.amplification_nodes[0].review_status = "可信"
+    result.amplification_nodes[1].review_status = "排除"
+
+    saved_count = save_review_session(
+        test_event_id,
+        result.first_post_nodes,
+        result.amplification_nodes,
+        result.sentiment_turning_points,
+    )
+    assert saved_count == 5, f"应保存5条标记，实际{saved_count}"
+
+    summary_before = get_review_summary(result)
+    assert summary_before.get("可信") == 2, f"应有2条可信：{summary_before}"
+    assert summary_before.get("存疑") == 1, f"应有1条存疑：{summary_before}"
+    assert summary_before.get("排除") == 2, f"应有2条排除：{summary_before}"
+
+    for n in result.first_post_nodes:
+        n.review_status = "待复核"
+    for n in result.amplification_nodes:
+        n.review_status = "待复核"
+    for p in result.sentiment_turning_points:
+        p.review_status = "待复核"
+
+    restored_count = load_review_session(
+        test_event_id,
+        result.first_post_nodes,
+        result.amplification_nodes,
+        result.sentiment_turning_points,
+    )
+    assert restored_count >= 5, f"应至少恢复5条标记，实际{restored_count}"
+
+    summary_after = get_review_summary(result)
+    total_marked = (summary_after.get("可信", 0)
+                    + summary_after.get("存疑", 0)
+                    + summary_after.get("排除", 0))
+    assert summary_after.get("可信") >= 2, f"恢复后可信应>=2：{summary_after}"
+    assert summary_after.get("存疑") >= 1, f"恢复后存疑应>=1：{summary_after}"
+    assert summary_after.get("排除") >= 2, f"恢复后排除应>=2：{summary_after}"
+    assert total_marked >= 5, f"恢复后合计标记应>=5：{summary_after}"
+
+    clear_review_session(test_event_id)
+    restored2 = load_review_session(
+        test_event_id,
+        result.first_post_nodes,
+        result.amplification_nodes,
+        result.sentiment_turning_points,
+    )
+    assert restored2 == 0, "清理后应恢复0条"
+
+    print(f"  标记并保存：{saved_count} 条")
+    print(f"  清空后恢复：{restored_count} 条（匹配成功）")
+    print(f"  复核统计：可信{summary_after.get('可信',0)} / 存疑{summary_after.get('存疑',0)} / 排除{summary_after.get('排除',0)}")
+    print(f"  {PASS} 复核记录保存/恢复功能正常")
+    return True
+
+
+def test_review_summary_export():
+    print(f"\n{Fore.CYAN}{Style.BRIGHT}{'=' * 60}")
+    print(f"{Fore.CYAN}{Style.BRIGHT}  测试 16：复核统计在报告中可见")
+    print(f"{Fore.CYAN}{Style.BRIGHT}{'=' * 60}{Style.RESET_ALL}\n")
+
+    from data_loader import load_csv
+    from analyzer import run_analysis
+    from exporter import (
+        _generate_full_report_text,
+        _generate_full_report_markdown,
+    )
+
+    config = _make_config()
+    config.exclude_words = []
+
+    posts, _, stats = load_csv("sample_data.csv", config)
+    result = run_analysis(posts, config, import_stats=[stats])
+
+    result.first_post_nodes[0].review_status = "可信"
+    if len(result.first_post_nodes) > 1:
+        result.first_post_nodes[1].review_status = "存疑"
+    if len(result.amplification_nodes) > 0:
+        result.amplification_nodes[0].review_status = "排除"
+
+    full_txt = _generate_full_report_text(result, config.event_id, filter_excluded=True)
+    assert "复核状态" in full_txt or "可信" in full_txt, \
+        "TXT完整报告应包含复核状态"
+
+    full_md = _generate_full_report_markdown(result, config.event_id, filter_excluded=True)
+    assert "复核统计" in full_md, "Markdown报告应包含复核统计行"
+    assert "可信" in full_md and "存疑" in full_md and "排除" in full_md, \
+        "Markdown报告复核统计应显示各类别"
+
+    print(f"  TXT报告：含复核状态标记")
+    print(f"  Markdown报告：含复核统计表格行（可信/存疑/排除）")
+    print(f"  {PASS} 复核统计在报告中可见")
+    return True
+
+
 def main():
     print(f"\n{Fore.CYAN}{Style.BRIGHT}{'=' * 60}")
     print(f"{Fore.CYAN}{Style.BRIGHT}  舆情溯源工作台 v2.5 自动化测试")
@@ -470,6 +702,10 @@ def main():
         ("effective_engagement 属性", test_effective_engagement),
         ("内容相似度去重", test_content_similarity),
         ("完整工作流程", test_full_flow),
+        ("时间线排除节点过滤", test_timeline_filtering),
+        ("互动口径全链路持久化", test_engagement_caliber_persistence),
+        ("复核记录保存/恢复", test_review_persistence),
+        ("复核统计在报告中可见", test_review_summary_export),
     ]
 
     passed = 0
@@ -500,13 +736,16 @@ def main():
     print(f"  {PASS} 排除词严格过滤")
     print(f"  {PASS} CSV/JSON 本地样本导入")
     print(f"  {PASS} 批量导入+多文件合并+智能去重")
+    print(f"  {PASS} 每文件重复计数+重复来源提示")
     print(f"  {PASS} 总互动量单列兼容（自动识别）")
     print(f"  {PASS} 数据源标记（日报可见）")
-    print(f"  {PASS} 互动量口径标记")
+    print(f"  {PASS} 互动量口径全链路标记")
     print(f"  {PASS} 三类结果复核（含情绪拐点）")
-    print(f"  {PASS} 排除项过滤，不进入最终简报")
+    print(f"  {PASS} 复核记录持久化+可继续")
+    print(f"  {PASS} 排除项过滤（含时间线），不进入最终简报")
     print(f"  {PASS} 按可信度自动排序")
     print(f"  {PASS} 传播时间线视图（终端+日报）")
+    print(f"  {PASS} 复核统计（可信/存疑/排除）入报告")
     print(f"  {PASS} TXT/Markdown 格式导出（完整报告+日报）")
     print(f"  {PASS} 文件名区分 full/reviewed/daily")
     print(f"  {PASS} 导出目录记忆（下次默认）")
