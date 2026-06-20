@@ -27,6 +27,12 @@ class VerificationType(str, Enum):
     GOV = "政府认证"
 
 
+class DataSource(str, Enum):
+    MOCK = "模拟数据"
+    CSV = "CSV导入"
+    JSON = "JSON导入"
+
+
 @dataclass
 class Post:
     post_id: str
@@ -44,6 +50,8 @@ class Post:
     share_count: int = 0
     source_url: Optional[str] = None
     tags: List[str] = field(default_factory=list)
+    data_source: DataSource = DataSource.MOCK
+    raw_id: Optional[str] = None
 
 
 @dataclass
@@ -73,6 +81,8 @@ class SentimentTurningPoint:
     sentiment_ratio: dict
     trigger_posts: List[Post]
     description: str
+    review_status: str = "待复核"
+    review_reason: str = ""
 
 
 @dataclass
@@ -82,3 +92,5 @@ class AnalysisResult:
     sentiment_turning_points: List[SentimentTurningPoint]
     total_posts: int
     time_range: str
+    data_source: DataSource = DataSource.MOCK
+    source_file: Optional[str] = None

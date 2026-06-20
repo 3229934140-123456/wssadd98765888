@@ -3,6 +3,7 @@ from datetime import datetime, timedelta
 from typing import List
 
 from models import (
+    DataSource,
     Post,
     Platform,
     Sentiment,
@@ -183,10 +184,13 @@ def generate_mock_data(config: TraceConfig, count: int = 200) -> List[Post]:
 
         content = _generate_content(config.keywords, platform)
 
+        excluded = False
         for ew in config.exclude_words:
             if ew in content:
-                if random.random() > 0.5:
-                    continue
+                excluded = True
+                break
+        if excluded:
+            continue
 
         post = Post(
             post_id=f"{platform.value[:2]}-{i:06d}",
@@ -203,6 +207,7 @@ def generate_mock_data(config: TraceConfig, count: int = 200) -> List[Post]:
             like_count=like,
             share_count=share,
             tags=[random.choice(config.keywords)],
+            data_source=DataSource.MOCK,
         )
         posts.append(post)
 

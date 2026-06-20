@@ -1,8 +1,9 @@
 from datetime import datetime, timedelta
-from typing import List
+from typing import List, Optional
 
 from models import (
     AnalysisResult,
+    DataSource,
     KeyNode,
     Post,
     Sentiment,
@@ -219,7 +220,9 @@ def find_sentiment_turning_points(
     return turning_points[:top_n]
 
 
-def run_analysis(posts: List[Post], config: TraceConfig) -> AnalysisResult:
+def run_analysis(posts: List[Post], config: TraceConfig,
+                 data_source: DataSource = DataSource.MOCK,
+                 source_file: Optional[str] = None) -> AnalysisResult:
     first_nodes = find_first_post_nodes(posts, config)
     amp_nodes = find_amplification_nodes(posts, config)
     sentiment_points = find_sentiment_turning_points(posts, config)
@@ -232,4 +235,6 @@ def run_analysis(posts: List[Post], config: TraceConfig) -> AnalysisResult:
         sentiment_turning_points=sentiment_points,
         total_posts=len(posts),
         time_range=time_range,
+        data_source=data_source,
+        source_file=source_file,
     )
