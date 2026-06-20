@@ -10,9 +10,12 @@ from colorama import Fore, Style, init
 
 from models import (
     DataSource,
+    DuplicateCluster,
+    DirtyDataEntry,
     ImportStats,
     Post,
     Platform,
+    SampleQualityReport,
     Sentiment,
     TraceConfig,
     VerificationType,
@@ -544,7 +547,7 @@ def _print_import_summary(all_stats: List[ImportStats], total_duplicates: int,
 
 
 def load_batch_files(file_paths: List[str], config: TraceConfig) -> Tuple[
-    List[Post], str, List[ImportStats], bool, int
+    List[Post], str, List[ImportStats], bool, int, set
 ]:
     all_posts: List[Post] = []
     all_stats: List[ImportStats] = []
@@ -604,10 +607,243 @@ def load_batch_files(file_paths: List[str], config: TraceConfig) -> Tuple[
     if has_total_engagement:
         summary += "（总互动量口径）"
 
-    return deduped_posts, summary, all_stats, has_total_engagement, dup_count
+    return deduped_posts, summary, all_stats, has_total_engagement, dup_count, dup_ids
 
 
-def prompt_data_source(config: TraceConfig) -> Tuple[List[Post], DataSource, Optional[str], List, bool]:
+def generate_quality_report(posts: List[Post], all_stats: Optional[List[ImportStats]] = None,
+                            dup_ids: Optional[set] = None) -> SampleQualityReport:
+    report = SampleQualityReport()
+    report.total_posts = len(posts)
+
+    platform_cov: Dict[str, int] = {}
+    time_cov: Dict[str, int] = {}
+    account_cov: Dict[str, int] = {}
+
+    for post in posts:
+        pname = post.platform.value
+        platform_cov[pname] = platform_cov.get(pname, 0) + 1
+
+        hour_key = post.publish_time.strftime("%Y-%m-%d %H:00")
+        time_cov[hour_key] = time_cov.get(hour_key, 0) + 1
+
+        vname = post.verification.value
+        account_cov[vname] = account_cov.get(vname, 0) + 1
+
+    report.platform_coverage = platform_cov
+    report.time_coverage = time_cov
+    report.account_type_coverage = account_cov
+
+    if dup_ids:
+        report.duplicate_count = len(dup_ids)
+        report.unique_posts = len(posts) - len(dup_ids)
+    else:
+        report.unique_posts = len(posts)
+
+    if dup_ids and posts:
+        dup_posts = [p for p in posts if p.post_id in dup_ids]
+        clusters: Dict[str, List[Post]] = {}
+        for dp in dup_posts:
+            ck = f"{dp.platform.value}|{dp.username}|{dp.publish_time.strftime('%Y%m%d%H%M')}"
+            if ck not in clusters:
+                clusters[ck] = []
+            clusters[ck].append(dp)
+
+        for ck, members in clusters.items():
+            if len(members) < 2:
+                continue
+            rep = members[0]
+            member_ids = [m.post_id for m in members]
+            report.duplicate_clusters.append(DuplicateCluster(
+                representative_id=rep.post_id,
+                member_ids=member_ids,
+                platform=rep.platform.value,
+                username=rep.username,
+                content_preview=rep.content[:50],
+            ))
+
+    if all_stats:
+        for stats in all_stats:
+            for err_msg in stats.error_messages:
+                try:
+                    line_num = err_msg.split("第")[1].split("行")[0]
+                    prefix = ""
+                    for pid_candidate in [p.post_id for p in posts]:
+                        pass
+                    report.dirty_data.append(DirtyDataEntry(
+                        post_id=f"{os.path.basename(stats.file_path)}:{line_num}",
+                        file_path=stats.file_path,
+                        reason=err_msg,
+                    ))
+                except Exception:
+                    report.dirty_data.append(DirtyDataEntry(
+                        post_id="unknown",
+                        file_path=stats.file_path,
+                        reason=err_msg,
+                    ))
+
+        files_with_issues = set()
+        for stats in all_stats:
+            has_issues = (stats.duplicate_count > stats.total_count * 0.3
+                          or stats.failed_count > stats.total_count * 0.2
+                          or len(stats.error_messages) > 3)
+            if has_issues:
+                files_with_issues.add(stats.file_path)
+        report.cleanup_files = sorted(files_with_issues)
+
+    return report
+
+
+def print_quality_report(report: SampleQualityReport):
+    print(f"\n{Fore.CYAN}{Style.BRIGHT}{'=' * 60}")
+    print(f"{Fore.CYAN}{Style.BRIGHT}  样本质量报告")
+    print(f"{Fore.CYAN}{Style.BRIGHT}{'=' * 60}{Style.RESET_ALL}\n")
+
+    print(f"  总样本数：{report.total_posts}")
+    print(f"  去重后样本数：{report.unique_posts}")
+    if report.duplicate_count > 0:
+        print(f"  {Fore.YELLOW}重复数：{report.duplicate_count}{Style.RESET_ALL}")
+    print()
+
+    if report.platform_coverage:
+        print(f"  {Fore.WHITE}{Style.BRIGHT}> 平台覆盖{Style.RESET_ALL}")
+        sorted_plat = sorted(report.platform_coverage.items(), key=lambda x: -x[1])
+        for name, count in sorted_plat:
+            pct = count / report.total_posts * 100 if report.total_posts > 0 else 0
+            bar = "#" * int(pct / 5)
+            print(f"    {name:<8} {count:>4} 条 ({pct:>5.1f}%) {Fore.CYAN}{bar}{Style.RESET_ALL}")
+        print()
+
+    if report.time_coverage:
+        print(f"  {Fore.WHITE}{Style.BRIGHT}> 时间段覆盖（Top 10）{Style.RESET_ALL}")
+        sorted_time = sorted(report.time_coverage.items(), key=lambda x: -x[1])[:10]
+        for hour, count in sorted_time:
+            bar = "#" * min(count, 30)
+            print(f"    {hour}  {count:>3} 条 {Fore.LIGHTBLACK_EX}{bar}{Style.RESET_ALL}")
+        print()
+
+    if report.account_type_coverage:
+        print(f"  {Fore.WHITE}{Style.BRIGHT}> 账号类型覆盖{Style.RESET_ALL}")
+        sorted_acct = sorted(report.account_type_coverage.items(), key=lambda x: -x[1])
+        for name, count in sorted_acct:
+            pct = count / report.total_posts * 100 if report.total_posts > 0 else 0
+            print(f"    {name:<8} {count:>4} 条 ({pct:>5.1f}%)")
+        print()
+
+    if report.duplicate_clusters:
+        print(f"  {Fore.YELLOW}{Style.BRIGHT}> 重复簇（{len(report.duplicate_clusters)}个）{Style.RESET_ALL}")
+        for i, cluster in enumerate(report.duplicate_clusters[:8], 1):
+            print(f"    {i}. [{cluster.platform}] @{cluster.username} "
+                  f"({len(cluster.member_ids)}条重复)")
+            print(f"       {Fore.LIGHTBLACK_EX}{cluster.content_preview[:40]}...{Style.RESET_ALL}")
+        if len(report.duplicate_clusters) > 8:
+            print(f"    ... 还有 {len(report.duplicate_clusters) - 8} 个重复簇")
+        print()
+
+    if report.dirty_data:
+        print(f"  {Fore.RED}{Style.BRIGHT}> 脏数据（{len(report.dirty_data)}条）{Style.RESET_ALL}")
+        for dd in report.dirty_data[:5]:
+            print(f"    {Fore.RED}· {dd.file_path}: {dd.reason[:50]}{Style.RESET_ALL}")
+        if len(report.dirty_data) > 5:
+            print(f"    ... 还有 {len(report.dirty_data) - 5} 条")
+        print()
+
+    if report.cleanup_files:
+        print(f"  {Fore.YELLOW}{Style.BRIGHT}> 建议清理的文件{Style.RESET_ALL}")
+        for fp in report.cleanup_files:
+            print(f"    {Fore.YELLOW}· {fp}{Style.RESET_ALL}")
+        print()
+
+    print(f"{Fore.CYAN}{'=' * 60}{Style.RESET_ALL}\n")
+
+
+def export_quality_report(report: SampleQualityReport, output_dir: str,
+                          event_id: str = "") -> Optional[str]:
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+    except Exception:
+        return None
+
+    safe_id = "".join(c for c in event_id if c.isalnum() or c in ("-", "_")) or "report"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"QUALITY_{safe_id}_{timestamp}.txt"
+    filepath = os.path.join(output_dir, filename)
+
+    lines = []
+    lines.append("=" * 60)
+    lines.append("  样本质量报告")
+    lines.append("=" * 60)
+    lines.append(f"  事件编号：{event_id}")
+    lines.append(f"  生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append(f"  总样本数：{report.total_posts}")
+    lines.append(f"  去重后样本数：{report.unique_posts}")
+    lines.append(f"  重复数：{report.duplicate_count}")
+    lines.append("")
+
+    if report.platform_coverage:
+        lines.append("-" * 40)
+        lines.append("  平台覆盖")
+        lines.append("-" * 40)
+        for name, count in sorted(report.platform_coverage.items(), key=lambda x: -x[1]):
+            pct = count / report.total_posts * 100 if report.total_posts > 0 else 0
+            lines.append(f"  {name:<8} {count:>4} 条 ({pct:>5.1f}%)")
+        lines.append("")
+
+    if report.time_coverage:
+        lines.append("-" * 40)
+        lines.append("  时间段覆盖")
+        lines.append("-" * 40)
+        for hour, count in sorted(report.time_coverage.items(), key=lambda x: -x[1])[:20]:
+            lines.append(f"  {hour}  {count:>3} 条")
+        lines.append("")
+
+    if report.account_type_coverage:
+        lines.append("-" * 40)
+        lines.append("  账号类型覆盖")
+        lines.append("-" * 40)
+        for name, count in sorted(report.account_type_coverage.items(), key=lambda x: -x[1]):
+            pct = count / report.total_posts * 100 if report.total_posts > 0 else 0
+            lines.append(f"  {name:<8} {count:>4} 条 ({pct:>5.1f}%)")
+        lines.append("")
+
+    if report.duplicate_clusters:
+        lines.append("-" * 40)
+        lines.append(f"  重复簇（{len(report.duplicate_clusters)}个）")
+        lines.append("-" * 40)
+        for i, cluster in enumerate(report.duplicate_clusters, 1):
+            lines.append(f"  {i}. [{cluster.platform}] @{cluster.username} "
+                         f"({len(cluster.member_ids)}条重复)")
+            lines.append(f"     代表ID：{cluster.representative_id}")
+            lines.append(f"     成员ID：{', '.join(cluster.member_ids[:5])}")
+            lines.append(f"     内容预览：{cluster.content_preview[:50]}")
+        lines.append("")
+
+    if report.dirty_data:
+        lines.append("-" * 40)
+        lines.append(f"  脏数据（{len(report.dirty_data)}条）")
+        lines.append("-" * 40)
+        for dd in report.dirty_data:
+            lines.append(f"  · [{dd.post_id}] {dd.reason}")
+        lines.append("")
+
+    if report.cleanup_files:
+        lines.append("-" * 40)
+        lines.append("  建议清理的文件清单")
+        lines.append("-" * 40)
+        for fp in report.cleanup_files:
+            lines.append(f"  · {fp}")
+        lines.append("")
+
+    lines.append("=" * 60)
+
+    try:
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+        return filepath
+    except Exception:
+        return None
+
+
+def prompt_data_source(config: TraceConfig) -> Tuple[List[Post], DataSource, Optional[str], List, bool, set]:
     print(f"\n{Fore.CYAN}{Style.BRIGHT}{'=' * 50}")
     print(f"{Fore.CYAN}{Style.BRIGHT}  数据来源选择")
     print(f"{Fore.CYAN}{Style.BRIGHT}{'=' * 50}{Style.RESET_ALL}\n")
@@ -625,7 +861,7 @@ def prompt_data_source(config: TraceConfig) -> Tuple[List[Post], DataSource, Opt
             print(f"{Fore.CYAN}使用模拟数据{Style.RESET_ALL}")
             from data_generator import generate_mock_data
             posts = generate_mock_data(config, count=300)
-            return posts, DataSource.MOCK, None, [], False
+            return posts, DataSource.MOCK, None, [], False, set()
 
         if choice in ("1", "2"):
             ext_hint = "CSV" if choice == "1" else "JSON"
@@ -661,11 +897,11 @@ def prompt_data_source(config: TraceConfig) -> Tuple[List[Post], DataSource, Opt
                 if confirm in ("", "y", "yes", "是"):
                     from data_generator import generate_mock_data
                     posts = generate_mock_data(config, count=300)
-                    return posts, DataSource.MOCK, None, [], False
-                return [], (DataSource.CSV if choice == "1" else DataSource.JSON), file_path, [stats], has_te
+                    return posts, DataSource.MOCK, None, [], False, set()
+                return [], (DataSource.CSV if choice == "1" else DataSource.JSON), file_path, [stats], has_te, set()
 
             ds = DataSource.CSV if choice == "1" else DataSource.JSON
-            return posts, ds, file_path, [stats], has_te
+            return posts, ds, file_path, [stats], has_te, set()
 
         if choice == "3":
             print(f"\n{Fore.CYAN}批量导入模式{Style.RESET_ALL}")
@@ -704,7 +940,7 @@ def prompt_data_source(config: TraceConfig) -> Tuple[List[Post], DataSource, Opt
                 if confirm in ("", "y", "yes", "是"):
                     break
 
-            posts, summary, stats_list, has_te, dup_count = load_batch_files(all_files, config)
+            posts, summary, stats_list, has_te, dup_count, dup_ids_batch = load_batch_files(all_files, config)
 
             if not posts:
                 print(f"{Fore.RED}没有有效数据，是否改用模拟数据？(y/n) y{Style.RESET_ALL}")
@@ -712,10 +948,10 @@ def prompt_data_source(config: TraceConfig) -> Tuple[List[Post], DataSource, Opt
                 if confirm in ("", "y", "yes", "是"):
                     from data_generator import generate_mock_data
                     posts = generate_mock_data(config, count=300)
-                    return posts, DataSource.MOCK, None, [], False
-                return posts, DataSource.CSV, f"批量({len(all_files)}文件)", stats_list, has_te
+                    return posts, DataSource.MOCK, None, [], False, set()
+                return posts, DataSource.CSV, f"批量({len(all_files)}文件)", stats_list, has_te, dup_ids_batch
 
             source_file = f"批量导入 {len(all_files)} 个文件"
-            return posts, DataSource.CSV, source_file, stats_list, has_te
+            return posts, DataSource.CSV, source_file, stats_list, has_te, dup_ids_batch
 
         print(f"{Fore.RED}无效选择，请输入 1、2、3 或 4{Style.RESET_ALL}")

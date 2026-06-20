@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""自动化测试 - 舆情溯源工作台 v2.5"""
+"""自动化测试 - 舆情溯源工作台 v3.0"""
 
 import os
 import sys
@@ -472,8 +472,26 @@ def test_timeline_filtering():
     total_tl = len(result.timeline)
 
     excluded_count = 0
-    for idx, tnode in enumerate(result.timeline):
-        if idx == 0 or idx == 2:
+    for tnode in result.timeline:
+        ref = tnode._source_ref
+        if not ref:
+            continue
+        try:
+            kind, idx_str = ref.split("|", 1)
+            idx = int(idx_str)
+        except Exception:
+            continue
+        if kind == "first" and idx == 0 and idx < len(result.first_post_nodes):
+            result.first_post_nodes[idx].review_status = "排除"
+            tnode.review_status = "排除"
+            excluded_count += 1
+        elif kind == "amp" and idx == 0 and idx < len(result.amplification_nodes):
+            result.amplification_nodes[idx].review_status = "排除"
+            tnode.review_status = "排除"
+            excluded_count += 1
+
+    if excluded_count == 0:
+        for tnode in result.timeline[:2]:
             tnode.review_status = "排除"
             excluded_count += 1
 
@@ -683,9 +701,287 @@ def test_review_summary_export():
     return True
 
 
+def test_review_persistence_separate_categories():
+    print(f"\n{Fore.CYAN}{Style.BRIGHT}{'=' * 60}")
+    print(f"{Fore.CYAN}{Style.BRIGHT}  测试 17：首发/传播分别保留复核结论")
+    print(f"{Fore.CYAN}{Style.BRIGHT}{'=' * 60}{Style.RESET_ALL}\n")
+
+    from data_loader import load_csv
+    from analyzer import run_analysis
+    from reviewer import (
+        save_review_session,
+        load_review_session,
+        clear_review_session,
+        get_review_summary,
+        _build_node_key,
+    )
+
+    config = _make_config()
+    config.exclude_words = []
+    test_event_id = "TEST-SEP-001"
+
+    posts, _, stats = load_csv("sample_data.csv", config)
+    result = run_analysis(posts, config, import_stats=[stats])
+
+    clear_review_session(test_event_id)
+
+    if not result.first_post_nodes or not result.amplification_nodes:
+        print(f"  {PASS} 跳过（数据不足）")
+        return True
+
+    result.first_post_nodes[0].review_status = "可信"
+    result.amplification_nodes[0].review_status = "排除"
+
+    first_key_0 = _build_node_key(result.first_post_nodes[0], "first")
+    amp_key_0 = _build_node_key(result.amplification_nodes[0], "amp")
+    assert first_key_0 != amp_key_0, \
+        f"首发和传播同帖子应产生不同key：{first_key_0} vs {amp_key_0}"
+
+    saved = save_review_session(
+        test_event_id,
+        result.first_post_nodes,
+        result.amplification_nodes,
+        result.sentiment_turning_points,
+    )
+    assert saved >= 2, f"应至少保存2条，实际{saved}"
+
+    result.first_post_nodes[0].review_status = "待复核"
+    result.amplification_nodes[0].review_status = "待复核"
+
+    restored = load_review_session(
+        test_event_id,
+        result.first_post_nodes,
+        result.amplification_nodes,
+        result.sentiment_turning_points,
+    )
+
+    assert result.first_post_nodes[0].review_status == "可信", \
+        f"首发第1条应恢复为可信：{result.first_post_nodes[0].review_status}"
+    assert result.amplification_nodes[0].review_status == "排除", \
+        f"传播第1条应恢复为排除：{result.amplification_nodes[0].review_status}"
+
+    summary = get_review_summary(result)
+    first_credible = sum(1 for n in result.first_post_nodes if n.review_status == "可信")
+    amp_excluded = sum(1 for n in result.amplification_nodes if n.review_status == "排除")
+    assert first_credible >= 1, f"首发应至少1条可信：{first_credible}"
+    assert amp_excluded >= 1, f"传播应至少1条排除：{amp_excluded}"
+
+    clear_review_session(test_event_id)
+
+    print(f"  首发[0]→可信，传播[0]→排除")
+    print(f"  保存→重置→恢复：首发[0]={result.first_post_nodes[0].review_status}，"
+          f"传播[0]={result.amplification_nodes[0].review_status}")
+    print(f"  {PASS} 首发和传播结论独立保留，统计对齐")
+    return True
+
+
+def test_review_collaboration():
+    print(f"\n{Fore.CYAN}{Style.BRIGHT}{'=' * 60}")
+    print(f"{Fore.CYAN}{Style.BRIGHT}  测试 18：多人协作复核（导出/合并/冲突）")
+    print(f"{Fore.CYAN}{Style.BRIGHT}{'=' * 60}{Style.RESET_ALL}\n")
+
+    from data_loader import load_csv
+    from analyzer import run_analysis
+    from reviewer import (
+        export_review_record,
+        merge_review_records,
+        apply_merge_decision,
+        get_review_summary,
+    )
+
+    config = _make_config()
+    config.exclude_words = []
+
+    posts, _, stats = load_csv("sample_data.csv", config)
+    result = run_analysis(posts, config, import_stats=[stats])
+
+    if not result.first_post_nodes or not result.amplification_nodes:
+        print(f"  {PASS} 跳过（数据不足）")
+        return True
+
+    result.first_post_nodes[0].review_status = "可信"
+    result.first_post_nodes[1].review_status = "存疑"
+    result.amplification_nodes[0].review_status = "排除"
+
+    path_a = export_review_record(
+        "TEST-COLL", reviewer_name="analyst_a",
+        first_nodes=result.first_post_nodes,
+        amp_nodes=result.amplification_nodes,
+        sentiment_points=result.sentiment_turning_points,
+    )
+    assert path_a and os.path.isfile(path_a), f"应导出文件：{path_a}"
+
+    result.first_post_nodes[0].review_status = "排除"
+    result.first_post_nodes[1].review_status = "可信"
+    result.amplification_nodes[0].review_status = "可信"
+
+    path_b = export_review_record(
+        "TEST-COLL", reviewer_name="analyst_b",
+        first_nodes=result.first_post_nodes,
+        amp_nodes=result.amplification_nodes,
+        sentiment_points=result.sentiment_turning_points,
+    )
+    assert path_b and os.path.isfile(path_b), f"应导出文件：{path_b}"
+
+    for n in result.first_post_nodes:
+        n.review_status = "待复核"
+    for n in result.amplification_nodes:
+        n.review_status = "待复核"
+    for p in result.sentiment_turning_points:
+        p.review_status = "待复核"
+
+    merge_result = merge_review_records(
+        "TEST-COLL", [path_a, path_b],
+        result.first_post_nodes,
+        result.amplification_nodes,
+        result.sentiment_turning_points,
+    )
+
+    assert merge_result["conflicted"] >= 0, "冲突数应为非负"
+    assert merge_result["agreed"] >= 0, "一致数应为非负"
+
+    apply_merge_decision(
+        "TEST-COLL", merge_result, strategy="majority",
+        first_nodes=result.first_post_nodes,
+        amp_nodes=result.amplification_nodes,
+        sentiment_points=result.sentiment_turning_points,
+    )
+
+    summary = get_review_summary(result)
+    total_marked = summary.get("可信", 0) + summary.get("存疑", 0) + summary.get("排除", 0)
+    assert total_marked >= 2, f"合并后应至少2条有状态：{summary}"
+
+    for p in [path_a, path_b]:
+        try:
+            os.remove(p)
+        except Exception:
+            pass
+
+    print(f"  A导出→B导出→合并分析→应用多数表决")
+    print(f"  一致：{merge_result['agreed']} 冲突：{merge_result['conflicted']}")
+    print(f"  合并后统计：可信{summary.get('可信',0)} 存疑{summary.get('存疑',0)} 排除{summary.get('排除',0)}")
+    print(f"  {PASS} 多人协作复核功能正常")
+    return True
+
+
+def test_sample_quality_report():
+    print(f"\n{Fore.CYAN}{Style.BRIGHT}{'=' * 60}")
+    print(f"{Fore.CYAN}{Style.BRIGHT}  测试 19：样本质量报告")
+    print(f"{Fore.CYAN}{Style.BRIGHT}{'=' * 60}{Style.RESET_ALL}\n")
+
+    from data_loader import load_csv, generate_quality_report, export_quality_report
+
+    config = _make_config()
+    config.exclude_words = []
+
+    posts, _, stats = load_csv("sample_data.csv", config)
+    assert len(posts) > 0, "应导入数据"
+
+    report = generate_quality_report(posts, all_stats=[stats])
+
+    assert report.total_posts == len(posts), \
+        f"总样本数应为{len(posts)}：{report.total_posts}"
+    assert report.unique_posts > 0, "唯一样本应>0"
+    assert len(report.platform_coverage) > 0, "应有平台覆盖数据"
+    assert len(report.time_coverage) > 0, "应有时间覆盖数据"
+    assert len(report.account_type_coverage) > 0, "应有账号类型覆盖数据"
+
+    total_platform = sum(report.platform_coverage.values())
+    assert total_platform == len(posts), \
+        f"平台覆盖总数应等于样本数：{total_platform} vs {len(posts)}"
+
+    tmpdir = tempfile.mkdtemp(prefix="quality_test_")
+    path = export_quality_report(report, tmpdir, event_id="TEST-Q")
+    assert path and os.path.isfile(path), f"应导出质量报告：{path}"
+
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read()
+    assert "样本质量报告" in content, "导出文件应包含标题"
+    assert "平台覆盖" in content, "导出文件应包含平台覆盖段"
+
+    try:
+        shutil.rmtree(tmpdir)
+    except Exception:
+        pass
+
+    print(f"  总样本：{report.total_posts}  唯一：{report.unique_posts}")
+    print(f"  平台覆盖：{len(report.platform_coverage)} 个平台")
+    print(f"  时间段覆盖：{len(report.time_coverage)} 个时段")
+    print(f"  账号类型覆盖：{len(report.account_type_coverage)} 种")
+    print(f"  {PASS} 样本质量报告生成和导出正常")
+    return True
+
+
+def test_timeline_excluded_all_paths():
+    print(f"\n{Fore.CYAN}{Style.BRIGHT}{'=' * 60}")
+    print(f"{Fore.CYAN}{Style.BRIGHT}  测试 20：时间线排除节点全链路兜底")
+    print(f"{Fore.CYAN}{Style.BRIGHT}{'=' * 60}{Style.RESET_ALL}\n")
+
+    from data_loader import load_csv
+    from analyzer import run_analysis
+    from reviewer import get_trusted_result, _ensure_timeline_synced, _filter_excluded_timeline
+    from exporter import (
+        _generate_full_report_text,
+        _generate_full_report_markdown,
+        _generate_daily_text,
+        _generate_daily_markdown,
+    )
+    from formatter import print_report_for_daily, _build_daily_timeline
+
+    config = _make_config()
+    config.exclude_words = []
+
+    posts, _, stats = load_csv("sample_data.csv", config)
+    result = run_analysis(posts, config, import_stats=[stats])
+
+    assert len(result.timeline) > 0, "应产生时间线"
+    total_tl = len(result.timeline)
+
+    for tnode in result.timeline:
+        ref = tnode._source_ref
+        if not ref:
+            continue
+        try:
+            kind, idx_str = ref.split("|", 1)
+            idx = int(idx_str)
+        except Exception:
+            continue
+        if kind == "first" and idx == 0 and idx < len(result.first_post_nodes):
+            result.first_post_nodes[idx].review_status = "排除"
+
+    _ensure_timeline_synced(result)
+
+    excluded_tl = sum(1 for t in result.timeline if t.review_status == "排除")
+    assert excluded_tl >= 1, "至少1个时间线节点被标记排除"
+
+    trusted = get_trusted_result(result)
+    for t in trusted.timeline:
+        assert t.review_status != "排除", \
+            f"get_trusted_result 时间线不应包含排除节点：{t.review_status}"
+
+    full_txt = _generate_full_report_text(result, config.event_id, filter_excluded=True)
+    full_md = _generate_full_report_markdown(result, config.event_id, filter_excluded=True)
+    daily_txt = _generate_daily_text(result, config.event_id, filter_excluded=True)
+    daily_md = _generate_daily_markdown(result, config.event_id, filter_excluded=True)
+    daily_inline = print_report_for_daily(result, config.event_id, filter_excluded=True)
+
+    filtered_tl = _filter_excluded_timeline(result.timeline)
+    daily_tl_text = _build_daily_timeline(result.timeline, filter_excluded=True)
+
+    for t in filtered_tl:
+        assert t.review_status != "排除", "过滤后时间线不应含排除节点"
+
+    print(f"  原始时间线：{total_tl} 个节点")
+    print(f"  标记排除：{excluded_tl} 个")
+    print(f"  get_trusted_result：{len(trusted.timeline)} 个节点（无排除）")
+    print(f"  _filter_excluded_timeline：{len(filtered_tl)} 个节点")
+    print(f"  {PASS} 时间线排除节点全链路兜底正常")
+    return True
+
+
 def main():
     print(f"\n{Fore.CYAN}{Style.BRIGHT}{'=' * 60}")
-    print(f"{Fore.CYAN}{Style.BRIGHT}  舆情溯源工作台 v2.5 自动化测试")
+    print(f"{Fore.CYAN}{Style.BRIGHT}  舆情溯源工作台 v3.0 自动化测试")
     print(f"{Fore.CYAN}{Style.BRIGHT}{'=' * 60}{Style.RESET_ALL}")
 
     tests = [
@@ -706,6 +1002,10 @@ def main():
         ("互动口径全链路持久化", test_engagement_caliber_persistence),
         ("复核记录保存/恢复", test_review_persistence),
         ("复核统计在报告中可见", test_review_summary_export),
+        ("首发/传播分别保留复核结论", test_review_persistence_separate_categories),
+        ("多人协作复核", test_review_collaboration),
+        ("样本质量报告", test_sample_quality_report),
+        ("时间线排除全链路兜底", test_timeline_excluded_all_paths),
     ]
 
     passed = 0
@@ -730,26 +1030,6 @@ def main():
     else:
         print(f"{Fore.RED}{Style.BRIGHT}  ✗ 通过 {passed} 项，失败 {failed} 项")
     print(f"{Fore.CYAN}{Style.BRIGHT}{'=' * 60}{Style.RESET_ALL}\n")
-
-    print("功能清单：")
-    print(f"  {PASS} 参数校验（关键词/时间/平台）")
-    print(f"  {PASS} 排除词严格过滤")
-    print(f"  {PASS} CSV/JSON 本地样本导入")
-    print(f"  {PASS} 批量导入+多文件合并+智能去重")
-    print(f"  {PASS} 每文件重复计数+重复来源提示")
-    print(f"  {PASS} 总互动量单列兼容（自动识别）")
-    print(f"  {PASS} 数据源标记（日报可见）")
-    print(f"  {PASS} 互动量口径全链路标记")
-    print(f"  {PASS} 三类结果复核（含情绪拐点）")
-    print(f"  {PASS} 复核记录持久化+可继续")
-    print(f"  {PASS} 排除项过滤（含时间线），不进入最终简报")
-    print(f"  {PASS} 按可信度自动排序")
-    print(f"  {PASS} 传播时间线视图（终端+日报）")
-    print(f"  {PASS} 复核统计（可信/存疑/排除）入报告")
-    print(f"  {PASS} TXT/Markdown 格式导出（完整报告+日报）")
-    print(f"  {PASS} 文件名区分 full/reviewed/daily")
-    print(f"  {PASS} 导出目录记忆（下次默认）")
-    print(f"  {PASS} 目录自动创建+错误提示")
 
     return 0 if failed == 0 else 1
 

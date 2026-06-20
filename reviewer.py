@@ -1,5 +1,6 @@
 import json
 import os
+from datetime import datetime
 from typing import List, Tuple, Optional, Dict
 
 from colorama import Fore, Style, init
@@ -44,28 +45,45 @@ def _review_file_path(event_id: str) -> str:
     return os.path.join(REVIEW_DIR, f"review_{_safe_event_id(event_id)}.json")
 
 
-def _build_node_key(node: KeyNode) -> str:
+def _build_node_key(node: KeyNode, category: str) -> str:
     p = node.post
-    return f"node|{p.platform.value}|{p.username}|{p.publish_time.strftime('%Y%m%d%H%M')}|{hash(p.content[:50]) % 10000:04d}"
+    return f"node|{category}|{p.platform.value}|{p.username}|{p.publish_time.strftime('%Y%m%d%H%M')}|{abs(hash(p.content[:50])) % 100000:05d}"
 
 
 def _build_sentiment_key(point: SentimentTurningPoint) -> str:
-    return f"sent|{point.time_point.strftime('%Y%m%d%H%M')}|{hash(point.description[:30]) % 10000:04d}"
+    return f"sent|{point.time_point.strftime('%Y%m%d%H%M')}|{abs(hash(point.description[:30])) % 100000:05d}"
 
 
 def save_review_session(event_id: str, first_nodes: List[KeyNode],
                         amp_nodes: List[KeyNode],
-                        sentiment_points: List[SentimentTurningPoint]) -> int:
-    data: Dict = {"version": 1, "nodes": {}, "sentiments": {}}
+                        sentiment_points: List[SentimentTurningPoint],
+                        reviewer_name: str = "") -> int:
+    data: Dict = {
+        "version": 2,
+        "reviewer": reviewer_name,
+        "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "nodes": {},
+        "sentiments": {},
+    }
     reviewed = 0
 
     for node in first_nodes:
         if node.review_status != "待复核":
-            data["nodes"][_build_node_key(node)] = {"status": node.review_status, "reason": ""}
+            key = _build_node_key(node, "first")
+            data["nodes"][key] = {
+                "status": node.review_status,
+                "reason": "",
+                "category": "first",
+            }
             reviewed += 1
     for node in amp_nodes:
         if node.review_status != "待复核":
-            data["nodes"][_build_node_key(node)] = {"status": node.review_status, "reason": ""}
+            key = _build_node_key(node, "amp")
+            data["nodes"][key] = {
+                "status": node.review_status,
+                "reason": "",
+                "category": "amp",
+            }
             reviewed += 1
     for point in sentiment_points:
         if point.review_status != "待复核":
@@ -102,12 +120,12 @@ def load_review_session(event_id: str, first_nodes: List[KeyNode],
     sent_map: Dict[str, dict] = data.get("sentiments", {})
 
     for node in first_nodes:
-        key = _build_node_key(node)
+        key = _build_node_key(node, "first")
         if key in node_map:
             node.review_status = node_map[key].get("status", "待复核")
             applied += 1
     for node in amp_nodes:
-        key = _build_node_key(node)
+        key = _build_node_key(node, "amp")
         if key in node_map:
             node.review_status = node_map[key].get("status", "待复核")
             applied += 1
@@ -141,6 +159,190 @@ def get_review_summary(result: AnalysisResult) -> Dict[str, int]:
         summary[p.review_status] = summary.get(p.review_status, 0) + 1
 
     return summary
+
+
+def export_review_record(event_id: str, reviewer_name: str = "",
+                         first_nodes: Optional[List[KeyNode]] = None,
+                         amp_nodes: Optional[List[KeyNode]] = None,
+                         sentiment_points: Optional[List[SentimentTurningPoint]] = None) -> Optional[str]:
+    _ensure_review_dir()
+    safe_name = "".join(c for c in reviewer_name if c.isalnum() or c in ("-", "_")) or "default"
+    path = os.path.join(REVIEW_DIR, f"review_{_safe_event_id(event_id)}_{safe_name}.json")
+
+    data: Dict = {
+        "version": 2,
+        "event_id": event_id,
+        "reviewer": reviewer_name,
+        "exported_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "nodes": {},
+        "sentiments": {},
+    }
+
+    for node in (first_nodes or []):
+        key = _build_node_key(node, "first")
+        data["nodes"][key] = {
+            "status": node.review_status,
+            "reason": "",
+            "category": "first",
+            "node_type": node.node_type,
+            "platform": node.post.platform.value,
+            "username": node.post.username,
+            "time": node.post.publish_time.strftime("%Y-%m-%d %H:%M"),
+        }
+    for node in (amp_nodes or []):
+        key = _build_node_key(node, "amp")
+        data["nodes"][key] = {
+            "status": node.review_status,
+            "reason": "",
+            "category": "amp",
+            "node_type": node.node_type,
+            "platform": node.post.platform.value,
+            "username": node.post.username,
+            "time": node.post.publish_time.strftime("%Y-%m-%d %H:%M"),
+        }
+    for point in (sentiment_points or []):
+        key = _build_sentiment_key(point)
+        data["sentiments"][key] = {
+            "status": point.review_status,
+            "reason": getattr(point, 'review_reason', ''),
+            "time": point.time_point.strftime("%Y-%m-%d %H:%M"),
+            "description": point.description[:60],
+        }
+
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        return path
+    except Exception as e:
+        print(f"  {Fore.RED}导出复核记录失败：{str(e)}{Style.RESET_ALL}")
+        return None
+
+
+def merge_review_records(event_id: str,
+                         record_paths: List[str],
+                         first_nodes: List[KeyNode],
+                         amp_nodes: List[KeyNode],
+                         sentiment_points: List[SentimentTurningPoint]) -> Dict:
+    all_records: List[Dict] = []
+    for rp in record_paths:
+        try:
+            with open(rp, "r", encoding="utf-8") as f:
+                all_records.append(json.load(f))
+        except Exception as e:
+            print(f"  {Fore.YELLOW}跳过无效记录 {rp}：{str(e)}{Style.RESET_ALL}")
+
+    if not all_records:
+        return {"agreed": 0, "conflicted": 0, "only_one": 0, "conflicts": []}
+
+    key_opinions: Dict[str, Dict[str, str]] = {}
+    for rec in all_records:
+        reviewer = rec.get("reviewer", "unknown")
+        for key, val in rec.get("nodes", {}).items():
+            if key not in key_opinions:
+                key_opinions[key] = {}
+            key_opinions[key][reviewer] = val.get("status", "待复核")
+        for key, val in rec.get("sentiments", {}).items():
+            if key not in key_opinions:
+                key_opinions[key] = {}
+            key_opinions[key][reviewer] = val.get("status", "待复核")
+
+    agreed = 0
+    conflicted = 0
+    only_one = 0
+    conflicts: List[Dict] = []
+
+    for key, opinions in key_opinions.items():
+        statuses = set(opinions.values())
+        if len(opinions) == 1:
+            only_one += 1
+        elif len(statuses) == 1:
+            agreed += 1
+        else:
+            conflicted += 1
+            conflicts.append({"key": key, "opinions": opinions})
+
+    print(f"\n{Fore.CYAN}{Style.BRIGHT}{'=' * 60}")
+    print(f"{Fore.CYAN}{Style.BRIGHT}  复核记录合并分析")
+    print(f"{Fore.CYAN}{Style.BRIGHT}{'=' * 60}{Style.RESET_ALL}\n")
+
+    print(f"  导入记录数：{len(all_records)}")
+    reviewers = [r.get('reviewer', 'unknown') for r in all_records]
+    print(f"  复核人：{' / '.join(reviewers)}")
+    print(f"  {Fore.GREEN}意见一致：{agreed} 条{Style.RESET_ALL}")
+    print(f"  {Fore.YELLOW}仅一人标记：{only_one} 条{Style.RESET_ALL}")
+    print(f"  {Fore.RED}意见冲突：{conflicted} 条{Style.RESET_ALL}")
+
+    if conflicts:
+        print(f"\n{Fore.RED}{Style.BRIGHT}> 冲突详情：{Style.RESET_ALL}")
+        for c in conflicts[:10]:
+            details = " vs ".join(f"{r}:{s}" for r, s in c["opinions"].items())
+            print(f"  {Fore.RED}· {c['key'][:40]}... {details}{Style.RESET_ALL}")
+
+    print()
+    return {
+        "agreed": agreed,
+        "conflicted": conflicted,
+        "only_one": only_one,
+        "conflicts": conflicts,
+        "records": all_records,
+    }
+
+
+def apply_merge_decision(event_id: str, merge_result: Dict,
+                         strategy: str = "majority",
+                         first_nodes: List[KeyNode] = None,
+                         amp_nodes: List[KeyNode] = None,
+                         sentiment_points: List[SentimentTurningPoint] = None):
+    all_records = merge_result.get("records", [])
+    if not all_records:
+        return
+
+    key_all_opinions: Dict[str, Dict[str, str]] = {}
+    for rec in all_records:
+        reviewer = rec.get("reviewer", "unknown")
+        for key, val in rec.get("nodes", {}).items():
+            if key not in key_all_opinions:
+                key_all_opinions[key] = {}
+            key_all_opinions[key][reviewer] = val.get("status", "待复核")
+        for key, val in rec.get("sentiments", {}).items():
+            if key not in key_all_opinions:
+                key_all_opinions[key] = {}
+            key_all_opinions[key][reviewer] = val.get("status", "待复核")
+
+    priority_map = {"可信": 0, "待复核": 1, "存疑": 2, "排除": 3}
+
+    key_status: Dict[str, str] = {}
+
+    for key, opinions in key_all_opinions.items():
+        statuses = list(opinions.values())
+        if len(statuses) == 1:
+            key_status[key] = statuses[0]
+        elif strategy == "majority":
+            from collections import Counter
+            counter = Counter(statuses)
+            key_status[key] = counter.most_common(1)[0][0]
+        elif strategy == "optimistic":
+            key_status[key] = min(statuses, key=lambda s: priority_map.get(s, 1))
+        elif strategy == "conservative":
+            key_status[key] = max(statuses, key=lambda s: priority_map.get(s, 1))
+        else:
+            key_status[key] = statuses[0]
+
+    if first_nodes:
+        for node in first_nodes:
+            key = _build_node_key(node, "first")
+            if key in key_status:
+                node.review_status = key_status[key]
+    if amp_nodes:
+        for node in amp_nodes:
+            key = _build_node_key(node, "amp")
+            if key in key_status:
+                node.review_status = key_status[key]
+    if sentiment_points:
+        for point in sentiment_points:
+            key = _build_sentiment_key(point)
+            if key in key_status:
+                point.review_status = key_status[key]
 
 
 def _sync_timeline_from_nodes(timeline: List[TimelineNode],
@@ -257,6 +459,18 @@ def _filter_excluded_timeline(timeline: List[TimelineNode]) -> List[TimelineNode
     return [t for t in timeline if t.review_status != "排除"]
 
 
+def _ensure_timeline_synced(result: AnalysisResult):
+    timeline = getattr(result, 'timeline', [])
+    if not timeline:
+        return
+    _sync_timeline_from_nodes(
+        timeline,
+        result.first_post_nodes,
+        result.amplification_nodes,
+        result.sentiment_turning_points,
+    )
+
+
 def run_review_mode(result: AnalysisResult, event_id: str) -> AnalysisResult:
     print(f"\n{Fore.MAGENTA}{Style.BRIGHT}{'=' * 60}")
     print(f"{Fore.MAGENTA}{Style.BRIGHT}  复核模式")
@@ -294,10 +508,14 @@ def run_review_mode(result: AnalysisResult, event_id: str) -> AnalysisResult:
                                   result.amplification_nodes,
                                   result.sentiment_turning_points)
     if applied > 0:
-        remaining = total - sum(
-            1 for _, _, item in all_items if item.review_status != "待复核"
-        )
+        already = sum(1 for _, _, item in all_items if item.review_status != "待复核")
+        remaining = total - already
         print(f"{Fore.GREEN}发现历史复核记录，已恢复 {applied} 项标记，剩余 {remaining} 项待复核{Style.RESET_ALL}")
+
+        first_marked = sum(1 for n in result.first_post_nodes if n.review_status != "待复核")
+        amp_marked = sum(1 for n in result.amplification_nodes if n.review_status != "待复核")
+        sent_marked = sum(1 for p in result.sentiment_turning_points if p.review_status != "待复核")
+        print(f"  首发已标{first_marked}  传播已标{amp_marked}  情绪已标{sent_marked}")
         print()
         action = input(f"{Fore.YELLOW}?{Style.RESET_ALL} [c]继续剩余  [r]重置从头开始  [a]放弃复核: ").strip().lower()
         if action == "r":
@@ -359,7 +577,6 @@ def run_review_mode(result: AnalysisResult, event_id: str) -> AnalysisResult:
                                         result.amplification_nodes,
                                         result.sentiment_turning_points)
             print(f"  {Fore.GREEN}进度已保存（已标记 {saved} 条）{Style.RESET_ALL}")
-            i -= 1
             continue
 
         if reviewed_count % 5 == 0 and reviewed_count > 0:
@@ -409,6 +626,8 @@ def run_review_mode(result: AnalysisResult, event_id: str) -> AnalysisResult:
 
 
 def get_trusted_result(result: AnalysisResult) -> AnalysisResult:
+    _ensure_timeline_synced(result)
+
     timeline = getattr(result, 'timeline', [])
     filtered_timeline = _filter_excluded_timeline(timeline) if timeline else []
 
@@ -436,24 +655,34 @@ def _print_reviewed_report(result: AnalysisResult, event_id: str):
     print(f"{Fore.CYAN}{'-' * 60}{Style.RESET_ALL}\n")
 
     summary = get_review_summary(result)
+    total_items = sum(summary.values())
 
-    print(f"{Fore.WHITE}{Style.BRIGHT}> 复核统计汇总{Style.RESET_ALL}")
+    print(f"{Fore.WHITE}{Style.BRIGHT}> 复核统计汇总（共{total_items}项）{Style.RESET_ALL}")
     print(f"  {Fore.GREEN}可信：{summary.get('可信', 0)}{Style.RESET_ALL}"
           f"  {Fore.YELLOW}存疑：{summary.get('存疑', 0)}{Style.RESET_ALL}"
           f"  {Fore.RED}排除：{summary.get('排除', 0)}{Style.RESET_ALL}"
           f"  {Fore.LIGHTBLACK_EX}待复核：{summary.get('待复核', 0)}{Style.RESET_ALL}")
+
+    first_s = {"可信": 0, "存疑": 0, "排除": 0, "待复核": 0}
+    amp_s = {"可信": 0, "存疑": 0, "排除": 0, "待复核": 0}
+    sent_s = {"可信": 0, "存疑": 0, "排除": 0, "待复核": 0}
+    for n in result.first_post_nodes:
+        first_s[n.review_status] = first_s.get(n.review_status, 0) + 1
+    for n in result.amplification_nodes:
+        amp_s[n.review_status] = amp_s.get(n.review_status, 0) + 1
+    for p in result.sentiment_turning_points:
+        sent_s[p.review_status] = sent_s.get(p.review_status, 0) + 1
+
+    print(f"  {Fore.LIGHTBLACK_EX}首发：可信{first_s['可信']} 存疑{first_s['存疑']} 排除{first_s['排除']} 待复核{first_s['待复核']}")
+    print(f"  {Fore.LIGHTBLACK_EX}传播：可信{amp_s['可信']} 存疑{amp_s['存疑']} 排除{amp_s['排除']} 待复核{amp_s['待复核']}")
+    print(f"  {Fore.LIGHTBLACK_EX}情绪：可信{sent_s['可信']} 存疑{sent_s['存疑']} 排除{sent_s['排除']} 待复核{sent_s['待复核']}")
     print()
 
     first_trusted = [n for n in result.first_post_nodes if n.review_status == "可信"]
-    first_doubt = [n for n in result.first_post_nodes if n.review_status == "存疑"]
-    first_excluded = [n for n in result.first_post_nodes if n.review_status == "排除"]
-
     amp_trusted = [n for n in result.amplification_nodes if n.review_status == "可信"]
-    amp_doubt = [n for n in result.amplification_nodes if n.review_status == "存疑"]
-    amp_excluded = [n for n in result.amplification_nodes if n.review_status == "排除"]
-
     sent_trusted = [p for p in result.sentiment_turning_points if p.review_status == "可信"]
-    sent_doubt = [p for p in result.sentiment_turning_points if p.review_status == "存疑"]
+    first_excluded = [n for n in result.first_post_nodes if n.review_status == "排除"]
+    amp_excluded = [n for n in result.amplification_nodes if n.review_status == "排除"]
     sent_excluded = [p for p in result.sentiment_turning_points if p.review_status == "排除"]
 
     if first_trusted:

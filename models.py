@@ -1,7 +1,7 @@
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 
 class Platform(str, Enum):
@@ -84,6 +84,36 @@ class ImportStats:
     filtered_count: int = 0
     duplicate_count: int = 0
     error_messages: List[str] = field(default_factory=list)
+
+
+@dataclass
+class DuplicateCluster:
+    representative_id: str
+    member_ids: List[str] = field(default_factory=list)
+    platform: str = ""
+    username: str = ""
+    content_preview: str = ""
+
+
+@dataclass
+class DirtyDataEntry:
+    post_id: str
+    file_path: str
+    reason: str
+    content_preview: str = ""
+
+
+@dataclass
+class SampleQualityReport:
+    total_posts: int = 0
+    unique_posts: int = 0
+    duplicate_count: int = 0
+    platform_coverage: Dict = field(default_factory=dict)
+    time_coverage: Dict = field(default_factory=dict)
+    account_type_coverage: Dict = field(default_factory=dict)
+    duplicate_clusters: List[DuplicateCluster] = field(default_factory=list)
+    dirty_data: List[DirtyDataEntry] = field(default_factory=list)
+    cleanup_files: List[str] = field(default_factory=list)
 
 
 @dataclass
