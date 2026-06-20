@@ -19,10 +19,11 @@ def print_banner():
     print(f"\n{Fore.CYAN}{Style.BRIGHT}")
     print(f"  ======  舆情热点溯源分析工作台  ======")
     print(f"{Style.RESET_ALL}")
-    print(f"{Fore.CYAN}  Public Opinion Trace Workbench v2.0")
+    print(f"{Fore.CYAN}  Public Opinion Trace Workbench v2.5")
     print(f"{Fore.LIGHTBLACK_EX}  快速产出突发热点初步溯源结果 · 面向专业分析师{Style.RESET_ALL}")
     print()
-    print(f"{Fore.LIGHTBLACK_EX}  支持：CSV/JSON导入 · 智能过滤 · 三类分析 · 专家复核 · 一键导出{Style.RESET_ALL}")
+    print(f"{Fore.LIGHTBLACK_EX}  支持：批量CSV/JSON导入 · 智能去重 · 时间线视图 · 总互动量兼容"
+          f" · 复核过滤 · 一键导出{Style.RESET_ALL}")
     print()
 
 
@@ -35,7 +36,7 @@ def main():
         print(f"\n\n{Fore.YELLOW}已取消操作{Style.RESET_ALL}")
         return
 
-    posts, data_source, source_file = prompt_data_source(config)
+    posts, data_source, source_file, import_stats, has_total_engagement = prompt_data_source(config)
 
     if not posts:
         print(f"{Fore.RED}没有有效数据，程序退出{Style.RESET_ALL}")
@@ -45,7 +46,7 @@ def main():
     if config.exclude_words:
         from data_loader import _filter_posts
         all_count = len(posts)
-        posts = _filter_posts(posts, config)
+        posts, _excluded = _filter_posts(posts, config)
         excluded_count = all_count - len(posts)
         if excluded_count > 0:
             print(f"{Fore.YELLOW}已排除 {excluded_count} 条不符合过滤条件的内容{Style.RESET_ALL}")
@@ -56,7 +57,13 @@ def main():
 
     print(f"\n{Fore.GREEN}{Style.BRIGHT}> 正在分析 {len(posts)} 条样本...{Style.RESET_ALL}\n")
 
-    result = run_analysis(posts, config, data_source=data_source, source_file=source_file)
+    result = run_analysis(
+        posts, config,
+        data_source=data_source,
+        source_file=source_file,
+        has_total_engagement=has_total_engagement,
+        import_stats=import_stats,
+    )
 
     print_full_report(result, config.event_id)
 

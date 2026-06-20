@@ -52,6 +52,36 @@ class Post:
     tags: List[str] = field(default_factory=list)
     data_source: DataSource = DataSource.MOCK
     raw_id: Optional[str] = None
+    total_engagement: Optional[int] = None
+
+    @property
+    def effective_engagement(self) -> int:
+        if self.total_engagement is not None and self.total_engagement > 0 \
+                and self.repost_count == 0 and self.comment_count == 0 \
+                and self.like_count == 0 and self.share_count == 0:
+            return self.total_engagement
+        return self.repost_count + self.comment_count + self.like_count + self.share_count
+
+
+@dataclass
+class TimelineNode:
+    time_point: datetime
+    node_type: str
+    title: str
+    description: str
+    related_post: Optional[Post] = None
+    sentiment_change: Optional[str] = None
+
+
+@dataclass
+class ImportStats:
+    file_path: str
+    total_count: int = 0
+    success_count: int = 0
+    failed_count: int = 0
+    filtered_count: int = 0
+    duplicate_count: int = 0
+    error_messages: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -90,7 +120,10 @@ class AnalysisResult:
     first_post_nodes: List[KeyNode]
     amplification_nodes: List[KeyNode]
     sentiment_turning_points: List[SentimentTurningPoint]
-    total_posts: int
-    time_range: str
+    timeline: List[TimelineNode] = field(default_factory=list)
+    total_posts: int = 0
+    time_range: str = ""
     data_source: DataSource = DataSource.MOCK
     source_file: Optional[str] = None
+    engagement_caliber: str = "分字段统计"
+    import_stats: List = field(default_factory=list)

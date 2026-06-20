@@ -4,17 +4,25 @@ from typing import List, Optional
 from models import (
     AnalysisResult,
     DataSource,
+    ImportStats,
     KeyNode,
     Post,
     Sentiment,
     SentimentTurningPoint,
+    TimelineNode,
     TraceConfig,
     VerificationType,
 )
 
 
 def _calculate_influence_score(post: Post) -> float:
-    base_eng = post.repost_count + post.comment_count * 2 + post.like_count + post.share_count * 3
+    if post.total_engagement is not None and post.total_engagement > 0 \
+            and post.repost_count == 0 and post.comment_count == 0 \
+            and post.like_count == 0 and post.share_count == 0:
+        base_eng = post.total_engagement
+    else:
+        base_eng = post.repost_count + post.comment_count * 2 + post.like_count + post.share_count * 3
+
     follower_factor = min(post.followers_count / 100000, 10)
     original_bonus = 1.5 if post.is_original else 0.6
 
@@ -85,7 +93,7 @@ def find_amplification_nodes(posts: List[Post], config: TraceConfig, top_n: int 
 
         reasons = []
 
-        total_eng = post.repost_count + post.comment_count + post.like_count + post.share_count
+        total_eng = post.effective_engagement
         if total_eng > 100000:
             reasons.append("超高互动量")
         elif total_eng > 10000:
@@ -177,7 +185,7 @@ def find_sentiment_turning_points(
 
             is_turning = False
             description = ""
-            trigger_posts = sorted(data["posts"], key=lambda p: p.repost_count + p.comment_count, reverse=True)[:3]
+            trigger_posts = sorted(data["posts"], key=lambda p: p.effective_engagement, reverse=True)[:3]
 
             if ratio_change > 0.15 and neg_ratio > 0.4:
                 is_turning = True
@@ -220,21 +228,78 @@ def find_sentiment_turning_points(
     return turning_points[:top_n]
 
 
+def build_timeline(first_nodes: List[KeyNode],
+                   amp_nodes: List[KeyNode],
+                   sentiment_points: List[SentimentTurningPoint],
+                   max_nodes: int = 15) -> List[TimelineNode]:
+    timeline: List[TimelineNode] = []
+
+    for node in first_nodes[:5]:
+        p = node.post
+        timeline.append(TimelineNode(
+            time_point=p.publish_time,
+            node_type="首发线索",
+            title=f"@{p.username} · {p.platform.value}",
+            description=f"{node.reason} | 互动{p.effective_engagement}",
+            related_post=p,
+        ))
+
+    for node in amp_nodes[:8]:
+        p = node.post
+        timeline.append(TimelineNode(
+            time_point=p.publish_time,
+            node_type="放大节点",
+            title=f"@{p.username} · {p.platform.value}",
+            description=f"{node.reason} | 互动{p.effective_engagement}",
+            related_post=p,
+        ))
+
+    for point in sentiment_points[:5]:
+        neg = point.sentiment_ratio.get("负面", 0)
+        if neg > 0.5:
+            change = "负面上升"
+        elif neg < 0.2:
+            change = "正面主导"
+        else:
+            change = "情绪波动"
+        timeline.append(TimelineNode(
+            time_point=point.time_point,
+            node_type="情绪拐点",
+            title=f"正{point.sentiment_ratio.get('正面', 0):.0%}/中{point.sentiment_ratio.get('中性', 0):.0%}/负{neg:.0%}",
+            description=point.description,
+            sentiment_change=change,
+        ))
+
+    timeline.sort(key=lambda t: t.time_point)
+    return timeline[:max_nodes]
+
+
 def run_analysis(posts: List[Post], config: TraceConfig,
                  data_source: DataSource = DataSource.MOCK,
-                 source_file: Optional[str] = None) -> AnalysisResult:
+                 source_file: Optional[str] = None,
+                 has_total_engagement: bool = False,
+                 import_stats: Optional[List[ImportStats]] = None) -> AnalysisResult:
     first_nodes = find_first_post_nodes(posts, config)
     amp_nodes = find_amplification_nodes(posts, config)
     sentiment_points = find_sentiment_turning_points(posts, config)
+    timeline = build_timeline(first_nodes, amp_nodes, sentiment_points)
 
     time_range = f"{config.start_time.strftime('%Y-%m-%d %H:%M')} ~ {config.end_time.strftime('%Y-%m-%d %H:%M')}"
+
+    if has_total_engagement:
+        engagement_caliber = "总互动量（单列合并统计）"
+    else:
+        engagement_caliber = "分字段统计（转/评/赞/分享）"
 
     return AnalysisResult(
         first_post_nodes=first_nodes,
         amplification_nodes=amp_nodes,
         sentiment_turning_points=sentiment_points,
+        timeline=timeline,
         total_posts=len(posts),
         time_range=time_range,
         data_source=data_source,
         source_file=source_file,
+        engagement_caliber=engagement_caliber,
+        import_stats=import_stats or [],
     )

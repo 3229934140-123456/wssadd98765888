@@ -1,6 +1,6 @@
 from colorama import Fore, Style, init
 
-from models import AnalysisResult, KeyNode, SentimentTurningPoint
+from models import AnalysisResult, KeyNode, SentimentTurningPoint, TimelineNode
 
 init(autoreset=True)
 
@@ -53,9 +53,14 @@ def _print_key_node(node: KeyNode, index: int, show_status: bool = False):
     print(f"    {Fore.LIGHTBLACK_EX}认证：{verif_color}{verif_str}"
           f"{Fore.LIGHTBLACK_EX}  |  粉丝：{_format_num(post.followers_count)}")
 
-    print(f"    {Fore.LIGHTBLACK_EX}互动：转{_format_num(post.repost_count)} "
-          f"评{_format_num(post.comment_count)} 赞{_format_num(post.like_count)} "
-          f"分享{_format_num(post.share_count)}")
+    if post.total_engagement is not None and post.total_engagement > 0 \
+            and post.repost_count == 0 and post.comment_count == 0 \
+            and post.like_count == 0 and post.share_count == 0:
+        print(f"    {Fore.LIGHTBLACK_EX}总互动量：{_format_num(post.total_engagement)}")
+    else:
+        print(f"    {Fore.LIGHTBLACK_EX}互动：转{_format_num(post.repost_count)} "
+              f"评{_format_num(post.comment_count)} 赞{_format_num(post.like_count)} "
+              f"分享{_format_num(post.share_count)}")
 
     orig_tag = f"{Fore.GREEN}[原创]{Style.RESET_ALL} " if post.is_original else ""
     sent_color = {
@@ -107,6 +112,35 @@ def _print_sentiment_point(point: SentimentTurningPoint, index: int, show_status
     print()
 
 
+def _print_timeline(timeline: list):
+    if not timeline:
+        return
+
+    _print_section_title("四、传播时间线", len(timeline))
+
+    type_color = {
+        "首发线索": Fore.GREEN,
+        "放大节点": Fore.YELLOW,
+        "情绪拐点": Fore.MAGENTA,
+    }
+
+    for i, node in enumerate(timeline, 1):
+        t_color = type_color.get(node.node_type, Fore.WHITE)
+        time_str = node.time_point.strftime("%m-%d %H:%M")
+
+        if node.node_type == "情绪拐点":
+            print(f"  {Fore.LIGHTBLACK_EX}[{time_str}] {t_color}[{node.node_type}] "
+                  f"{Fore.WHITE}{node.title}")
+            print(f"      {Fore.LIGHTBLACK_EX}{node.description}")
+        else:
+            print(f"  {Fore.LIGHTBLACK_EX}[{time_str}] {t_color}[{node.node_type}] "
+                  f"{Fore.WHITE}{node.title}")
+            if node.related_post:
+                print(f"      {Fore.LIGHTBLACK_EX}{_truncate_text(node.related_post.content, 60)}")
+            print(f"      {Fore.MAGENTA}{node.description}")
+        print()
+
+
 def print_summary_header(result: AnalysisResult, event_id: str):
     print(f"\n{Fore.CYAN}{Style.BRIGHT}{'=' * 60}")
     print(f"{Fore.CYAN}{Style.BRIGHT}  舆情热点溯源分析报告")
@@ -120,6 +154,10 @@ def print_summary_header(result: AnalysisResult, event_id: str):
         source_info += f" {Fore.LIGHTBLACK_EX}({result.source_file}){Style.RESET_ALL}"
     print(source_info)
 
+    if hasattr(result, 'engagement_caliber'):
+        cal_color = Fore.YELLOW if "总互动量" in result.engagement_caliber else Fore.GREEN
+        print(f"{Fore.LIGHTBLACK_EX}  互动量口径：{cal_color}{result.engagement_caliber}{Style.RESET_ALL}")
+
     print(f"{Fore.CYAN}{'-' * 60}{Style.RESET_ALL}")
 
 
@@ -129,6 +167,7 @@ def print_full_report(result: AnalysisResult, event_id: str, filter_excluded: bo
     first_nodes = result.first_post_nodes
     amp_nodes = result.amplification_nodes
     sentiment_points = result.sentiment_turning_points
+    timeline = getattr(result, 'timeline', [])
 
     if filter_excluded:
         first_nodes = [n for n in first_nodes if n.review_status != "排除"]
@@ -147,9 +186,42 @@ def print_full_report(result: AnalysisResult, event_id: str, filter_excluded: bo
     for i, point in enumerate(sentiment_points, 1):
         _print_sentiment_point(point, i, show_status=filter_excluded)
 
+    _print_timeline(timeline)
+
     print(f"\n{Fore.CYAN}{'=' * 60}")
     print(f"{Fore.CYAN}  报告生成完毕，共 {result.total_posts} 条样本")
     print(f"{Fore.CYAN}{'=' * 60}{Style.RESET_ALL}\n")
+
+
+def _build_daily_timeline(timeline: list, filter_excluded: bool = True) -> str:
+    if not timeline:
+        return ""
+
+    lines = []
+    lines.append("[传播时间线]")
+    type_icons = {"首发线索": "起", "放大节点": "扩", "情绪拐点": "情"}
+
+    count = 0
+    for node in timeline:
+        if count >= 8:
+            break
+        icon = type_icons.get(node.node_type, "·")
+        time_str = node.time_point.strftime("%m-%d %H:%M")
+        if node.node_type == "情绪拐点":
+            lines.append(f"  {count+1}. [{time_str}][{icon}] {node.title}")
+            lines.append(f"     {node.description}")
+        else:
+            title = node.title
+            if len(title) > 40:
+                title = title[:37] + "..."
+            lines.append(f"  {count+1}. [{time_str}][{icon}] {title}")
+            desc = node.description
+            if len(desc) > 50:
+                desc = desc[:47] + "..."
+            lines.append(f"     {desc}")
+        count += 1
+    lines.append("")
+    return "\n".join(lines)
 
 
 def print_report_for_daily(result: AnalysisResult, event_id: str, filter_excluded: bool = True) -> str:
@@ -159,11 +231,14 @@ def print_report_for_daily(result: AnalysisResult, event_id: str, filter_exclude
     lines.append(f"数据来源：{result.data_source.value}")
     if result.source_file:
         lines.append(f"来源文件：{result.source_file}")
+    if hasattr(result, 'engagement_caliber'):
+        lines.append(f"互动量口径：{result.engagement_caliber}")
     lines.append("")
 
     first_nodes = result.first_post_nodes
     amp_nodes = result.amplification_nodes
     sentiment_points = result.sentiment_turning_points
+    timeline = getattr(result, 'timeline', [])
 
     if filter_excluded:
         first_nodes = [n for n in first_nodes if n.review_status != "排除"]
@@ -214,10 +289,15 @@ def print_report_for_daily(result: AnalysisResult, event_id: str, filter_exclude
             f"  {count+1}. [{p.publish_time.strftime('%m-%d %H:%M')}] {p.platform.value} "
             f"@{p.username}({p.verification.value}){status_tag}"
         )
-        lines.append(
-            f"     互动：转{_format_num(p.repost_count)} 评{_format_num(p.comment_count)} "
-            f"赞{_format_num(p.like_count)}"
-        )
+        if p.total_engagement is not None and p.total_engagement > 0 \
+                and p.repost_count == 0 and p.comment_count == 0 \
+                and p.like_count == 0 and p.share_count == 0:
+            lines.append(f"     总互动量：{_format_num(p.total_engagement)}")
+        else:
+            lines.append(
+                f"     互动：转{_format_num(p.repost_count)} 评{_format_num(p.comment_count)} "
+                f"赞{_format_num(p.like_count)}"
+            )
         lines.append(f"     摘要：{_truncate_text(p.content, 50)}")
         lines.append(f"     判定：{node.reason}")
         count += 1
@@ -241,5 +321,13 @@ def print_report_for_daily(result: AnalysisResult, event_id: str, filter_exclude
         lines.append(f"     {point.description}")
         count += 1
     lines.append("")
+
+    timeline_text = _build_daily_timeline(timeline, filter_excluded=filter_excluded)
+    if timeline_text:
+        lines.append(timeline_text)
+    elif hasattr(result, 'timeline'):
+        lines.append("[传播时间线]")
+        lines.append("  暂无时间线数据")
+        lines.append("")
 
     return "\n".join(lines)

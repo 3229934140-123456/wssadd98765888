@@ -1,13 +1,16 @@
 import csv
+import difflib
+import glob
 import json
 import os
 from datetime import datetime
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from colorama import Fore, Style, init
 
 from models import (
     DataSource,
+    ImportStats,
     Post,
     Platform,
     Sentiment,
@@ -75,30 +78,13 @@ SENTIMENT_ALIASES = {
     "negative": Sentiment.NEGATIVE,
     "neg": Sentiment.NEGATIVE,
     "-1": Sentiment.NEGATIVE,
-    "-1": Sentiment.NEGATIVE,
 }
 
-REQUIRED_FIELDS = ["platform", "publish_time", "username", "content"]
-OPTIONAL_FIELDS = {
-    "verification": ("未认证", VERIFICATION_ALIASES),
-    "followers": (0, None),
-    "followers_count": (0, None),
-    "is_original": (True, None),
-    "original": (True, None),
-    "sentiment": ("中性", SENTIMENT_ALIASES),
-    "repost_count": (0, None),
-    "repost": (0, None),
-    "share": (0, None),
-    "share_count": (0, None),
-    "comment_count": (0, None),
-    "comment": (0, None),
-    "like_count": (0, None),
-    "like": (0, None),
-    "likes": (0, None),
-    "id": (None, None),
-    "post_id": (None, None),
-    "raw_id": (None, None),
-}
+ENGAGEMENT_ALIASES = [
+    "engagement", "total_engagement", "total_interaction",
+    "互动量", "总互动量", "互动数", "总互动数",
+    "热度", "声量", "pv", "uv",
+]
 
 
 def _parse_platform(value: str) -> Optional[Platform]:
@@ -178,7 +164,21 @@ def _parse_int(value, default: int = 0) -> int:
         return default
 
 
-def _map_row_to_post(row: dict, idx: int, data_source: DataSource) -> Tuple[Optional[Post], Optional[str]]:
+def _find_engagement_field(row: dict) -> Tuple[Optional[int], Optional[str]]:
+    for key in row.keys():
+        if key is None:
+            continue
+        key_lower = str(key).strip().lower()
+        for alias in ENGAGEMENT_ALIASES:
+            if alias.lower() in key_lower:
+                val = _parse_int(row[key], 0)
+                if val > 0:
+                    return val, key
+    return None, None
+
+
+def _map_row_to_post(row: dict, idx: int, data_source: DataSource,
+                     file_prefix: str = "IMP") -> Tuple[Optional[Post], Optional[str]]:
     try:
         platform = _parse_platform(row.get("platform", row.get("平台", "")))
         if not platform:
@@ -206,8 +206,10 @@ def _map_row_to_post(row: dict, idx: int, data_source: DataSource) -> Tuple[Opti
         share = _parse_int(row.get("share_count", row.get("分享", row.get("分享数", 0))))
         raw_id = str(row.get("id", row.get("post_id", row.get("raw_id", "")))) or None
 
+        total_eng, eng_field = _find_engagement_field(row)
+
         post = Post(
-            post_id=f"IMP-{idx:06d}",
+            post_id=f"{file_prefix}-{idx:06d}",
             platform=platform,
             username=username,
             verification=verification,
@@ -222,13 +224,69 @@ def _map_row_to_post(row: dict, idx: int, data_source: DataSource) -> Tuple[Opti
             share_count=share,
             raw_id=raw_id,
             data_source=data_source,
+            total_engagement=total_eng,
         )
         return post, None
     except Exception as e:
         return None, f"解析异常：{str(e)}"
 
 
-def _filter_posts(posts: List[Post], config: TraceConfig) -> List[Post]:
+def _content_similar(a: str, b: str, threshold: float = 0.85) -> bool:
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    short = a if len(a) < len(b) else b
+    long_str = b if len(a) < len(b) else a
+    if len(short) < 10:
+        return short in long_str
+    ratio = difflib.SequenceMatcher(None, a[:200], b[:200]).ratio()
+    return ratio >= threshold
+
+
+def _dedup_posts(posts: List[Post]) -> Tuple[List[Post], int]:
+    if not posts:
+        return [], 0
+
+    seen: Dict[str, Post] = {}
+    duplicate_count = 0
+
+    sorted_posts = sorted(posts, key=lambda p: (
+        p.platform.value,
+        p.username,
+        p.publish_time.strftime("%Y%m%d%H%M"),
+    ))
+
+    for post in sorted_posts:
+        time_key = post.publish_time.strftime("%Y%m%d%H%M")
+        exact_key = f"{post.platform.value}|{post.username}|{time_key}|{post.content[:30]}"
+
+        if exact_key in seen:
+            duplicate_count += 1
+            continue
+
+        is_dup = False
+        for key, existing in seen.items():
+            if existing.platform != post.platform:
+                continue
+            if existing.username != post.username:
+                continue
+            time_diff = abs((existing.publish_time - post.publish_time).total_seconds())
+            if time_diff > 300:
+                continue
+            if _content_similar(existing.content, post.content):
+                is_dup = True
+                duplicate_count += 1
+                break
+
+        if not is_dup:
+            seen[exact_key] = post
+
+    result = sorted(seen.values(), key=lambda p: p.publish_time)
+    return result, duplicate_count
+
+
+def _filter_posts(posts: List[Post], config: TraceConfig) -> Tuple[List[Post], int]:
     filtered = []
     excluded_count = 0
     for post in posts:
@@ -259,16 +317,19 @@ def _filter_posts(posts: List[Post], config: TraceConfig) -> List[Post]:
     if excluded_count > 0:
         print(f"{Fore.YELLOW}已排除 {excluded_count} 条包含排除词的内容{Style.RESET_ALL}")
 
-    return filtered
+    return filtered, excluded_count
 
 
-def load_csv(file_path: str, config: TraceConfig) -> Tuple[List[Post], str]:
+def load_csv(file_path: str, config: TraceConfig,
+             file_prefix: str = "CSV") -> Tuple[List[Post], str, ImportStats]:
+    stats = ImportStats(file_path=file_path)
     if not os.path.exists(file_path):
-        return [], f"文件不存在：{file_path}"
+        return [], f"文件不存在：{file_path}", stats
 
     data_source = DataSource.CSV
     posts = []
     errors = []
+    has_engagement_field = False
 
     try:
         with open(file_path, "r", encoding="utf-8-sig") as f:
@@ -282,49 +343,73 @@ def load_csv(file_path: str, config: TraceConfig) -> Tuple[List[Post], str]:
             has_content = any("content" in f or "正文" in f or "内容" in f for f in field_lower)
 
             if not (has_platform and has_time and has_user and has_content):
-                return [], f"CSV缺少必要字段。需要：平台(platform)、发布时间(publish_time)、账号(username)、正文(content)"
+                return [], f"CSV缺少必要字段。需要：平台(platform)、发布时间(publish_time)、账号(username)、正文(content)", stats
+
+            has_engagement_field = any(
+                any(alias in f for alias in [a.lower() for a in ENGAGEMENT_ALIASES])
+                for f in field_lower
+            )
 
             print(f"{Fore.GREEN}检测到字段：{', '.join(fieldnames)}{Style.RESET_ALL}")
+            if has_engagement_field:
+                print(f"{Fore.CYAN}  识别到总互动量字段，将使用总互动量口径{Style.RESET_ALL}")
 
-            for idx, row in enumerate(reader, 1):
-                post, err = _map_row_to_post(row, idx, data_source)
+            all_rows = list(reader)
+            stats.total_count = len(all_rows)
+
+            for idx, row in enumerate(all_rows, 1):
+                post, err = _map_row_to_post(row, idx, data_source, file_prefix=file_prefix)
                 if post:
                     posts.append(post)
+                    stats.success_count += 1
                 else:
                     errors.append(f"第{idx}行：{err}")
+                    stats.failed_count += 1
 
     except UnicodeDecodeError:
         try:
             with open(file_path, "r", encoding="gbk") as f:
                 reader = csv.DictReader(f)
-                for idx, row in enumerate(reader, 1):
-                    post, err = _map_row_to_post(row, idx, data_source)
+                all_rows = list(reader)
+                stats.total_count = len(all_rows)
+                for idx, row in enumerate(all_rows, 1):
+                    post, err = _map_row_to_post(row, idx, data_source, file_prefix=file_prefix)
                     if post:
                         posts.append(post)
+                        stats.success_count += 1
                     else:
                         errors.append(f"第{idx}行：{err}")
+                        stats.failed_count += 1
         except Exception as e:
-            return [], f"文件编码错误，尝试UTF-8和GBK均失败：{str(e)}"
+            return [], f"文件编码错误，尝试UTF-8和GBK均失败：{str(e)}", stats
     except Exception as e:
-        return [], f"读取CSV失败：{str(e)}"
+        return [], f"读取CSV失败：{str(e)}", stats
 
-    filtered = _filter_posts(posts, config)
+    filtered_posts, filtered_count = _filter_posts(posts, config)
+    stats.filtered_count = stats.success_count - len(filtered_posts)
+    stats.error_messages = errors[:5]
 
     if errors:
         print(f"{Fore.YELLOW}共 {len(errors)} 条数据解析失败，前5条错误：{Style.RESET_ALL}")
         for err in errors[:5]:
             print(f"  {Fore.LIGHTBLACK_EX}- {err}{Style.RESET_ALL}")
 
-    return filtered, f"CSV导入：成功{len(filtered)}条，失败{len(errors)}条"
+    msg = f"CSV导入：总{stats.total_count}条，成功{len(filtered_posts)}条，失败{stats.failed_count}条，过滤{stats.filtered_count}条"
+    if has_engagement_field:
+        msg += "（总互动量口径）"
+    return filtered_posts, msg, stats
 
 
-def load_json(file_path: str, config: TraceConfig) -> Tuple[List[Post], str]:
+def load_json(file_path: str, config: TraceConfig,
+              file_prefix: str = "JSON") -> Tuple[List[Post], str, ImportStats]:
+    stats = ImportStats(file_path=file_path)
     if not os.path.exists(file_path):
-        return [], f"文件不存在：{file_path}"
+        return [], f"文件不存在：{file_path}", stats
 
     data_source = DataSource.JSON
     posts = []
     errors = []
+    has_engagement_field = False
 
     try:
         with open(file_path, "r", encoding="utf-8") as f:
@@ -341,98 +426,194 @@ def load_json(file_path: str, config: TraceConfig) -> Tuple[List[Post], str]:
                 data = [data]
 
         if not isinstance(data, list):
-            return [], "JSON格式错误，需要数组或包含数组的对象"
+            return [], "JSON格式错误，需要数组或包含数组的对象", stats
+
+        if data and isinstance(data[0], dict):
+            field_lower = [str(k).lower() for k in data[0].keys()]
+            has_engagement_field = any(
+                any(alias in f for alias in [a.lower() for a in ENGAGEMENT_ALIASES])
+                for f in field_lower
+            )
 
         print(f"{Fore.GREEN}检测到 {len(data)} 条记录{Style.RESET_ALL}")
+        if has_engagement_field:
+            print(f"{Fore.CYAN}  识别到总互动量字段，将使用总互动量口径{Style.RESET_ALL}")
+
+        stats.total_count = len(data)
 
         for idx, item in enumerate(data, 1):
             if not isinstance(item, dict):
                 errors.append(f"第{idx}条：不是对象")
+                stats.failed_count += 1
                 continue
-            post, err = _map_row_to_post(item, idx, data_source)
+            post, err = _map_row_to_post(item, idx, data_source, file_prefix=file_prefix)
             if post:
                 posts.append(post)
+                stats.success_count += 1
             else:
                 errors.append(f"第{idx}条：{err}")
+                stats.failed_count += 1
 
     except json.JSONDecodeError as e:
-        return [], f"JSON解析错误：{str(e)}"
+        return [], f"JSON解析错误：{str(e)}", stats
     except Exception as e:
-        return [], f"读取JSON失败：{str(e)}"
+        return [], f"读取JSON失败：{str(e)}", stats
 
-    filtered = _filter_posts(posts, config)
+    filtered_posts, filtered_count = _filter_posts(posts, config)
+    stats.filtered_count = stats.success_count - len(filtered_posts)
+    stats.error_messages = errors[:5]
 
     if errors:
         print(f"{Fore.YELLOW}共 {len(errors)} 条数据解析失败，前5条错误：{Style.RESET_ALL}")
         for err in errors[:5]:
             print(f"  {Fore.LIGHTBLACK_EX}- {err}{Style.RESET_ALL}")
 
-    return filtered, f"JSON导入：成功{len(filtered)}条，失败{len(errors)}条"
+    msg = f"JSON导入：总{stats.total_count}条，成功{len(filtered_posts)}条，失败{stats.failed_count}条，过滤{stats.filtered_count}条"
+    if has_engagement_field:
+        msg += "（总互动量口径）"
+    return filtered_posts, msg, stats
 
 
-def prompt_data_source(config: TraceConfig) -> Tuple[List[Post], DataSource, Optional[str]]:
+def _expand_file_pattern(pattern: str) -> List[str]:
+    pattern = pattern.strip().strip('"').strip("'")
+    if not pattern:
+        return []
+
+    if os.path.isdir(pattern):
+        files = []
+        for ext in ("*.csv", "*.json"):
+            files.extend(glob.glob(os.path.join(pattern, ext)))
+        return sorted(files)
+
+    if any(c in pattern for c in "*?[]"):
+        return sorted(glob.glob(pattern))
+
+    if os.path.isfile(pattern):
+        return [pattern]
+
+    return [pattern]
+
+
+def _print_import_summary(all_stats: List[ImportStats], total_duplicates: int,
+                          final_count: int, has_total_engagement: bool):
+    print(f"\n{Fore.CYAN}{Style.BRIGHT}{'=' * 60}")
+    print(f"{Fore.CYAN}{Style.BRIGHT}  批量导入统计汇总")
+    print(f"{Fore.CYAN}{Style.BRIGHT}{'=' * 60}{Style.RESET_ALL}\n")
+
+    grand_total = sum(s.total_count for s in all_stats)
+    grand_success = sum(s.success_count for s in all_stats)
+    grand_failed = sum(s.failed_count for s in all_stats)
+    grand_filtered = sum(s.filtered_count for s in all_stats)
+
+    print(f"  {'文件':<30} {'总数':>6} {'成功':>6} {'失败':>6} {'过滤':>6}")
+    print(f"  {'-' * 56}")
+    for s in all_stats:
+        fname = os.path.basename(s.file_path)
+        if len(fname) > 28:
+            fname = fname[:25] + "..."
+        print(f"  {fname:<30} {s.total_count:>6} {s.success_count:>6} {s.failed_count:>6} {s.filtered_count:>6}")
+    print(f"  {'-' * 56}")
+    print(f"  {'合计':<30} {grand_total:>6} {grand_success:>6} {grand_failed:>6} {grand_filtered:>6}")
+    print(f"  {'去重剔除':<30} {'':>6} {total_duplicates:>6}")
+    print(f"  {'最终样本数':<30} {'':>6} {final_count:>6}")
+    print()
+    if has_total_engagement:
+        print(f"  {Fore.YELLOW}互动量口径：总互动量（单列合并统计）{Style.RESET_ALL}")
+    else:
+        print(f"  {Fore.GREEN}互动量口径：分字段统计（转/评/赞/分享）{Style.RESET_ALL}")
+    print()
+
+
+def load_batch_files(file_paths: List[str], config: TraceConfig) -> Tuple[
+    List[Post], str, List[ImportStats], bool, int
+]:
+    all_posts: List[Post] = []
+    all_stats: List[ImportStats] = []
+    has_total_engagement = False
+
+    for i, fp in enumerate(file_paths, 1):
+        ext = os.path.splitext(fp)[1].lower()
+        prefix = f"F{i:02d}"
+
+        print(f"\n{Fore.CYAN}[{i}/{len(file_paths)}] 处理：{fp}{Style.RESET_ALL}")
+
+        if ext == ".csv":
+            posts, msg, stats = load_csv(fp, config, file_prefix=prefix)
+        elif ext == ".json":
+            posts, msg, stats = load_json(fp, config, file_prefix=prefix)
+        else:
+            print(f"{Fore.YELLOW}  跳过不支持的文件类型：{ext}{Style.RESET_ALL}")
+            continue
+
+        print(f"  {Fore.GREEN}{msg}{Style.RESET_ALL}")
+        all_posts.extend(posts)
+        all_stats.append(stats)
+
+        if posts:
+            if any(p.total_engagement is not None and p.total_engagement > 0 for p in posts):
+                has_total_engagement = True
+
+    deduped_posts, dup_count = _dedup_posts(all_posts)
+
+    _print_import_summary(all_stats, dup_count, len(deduped_posts), has_total_engagement)
+
+    source_files = ", ".join(os.path.basename(fp) for fp in file_paths[:3])
+    if len(file_paths) > 3:
+        source_files += f" 等{len(file_paths)}个文件"
+    summary = f"批量导入{len(file_paths)}个文件：最终{len(deduped_posts)}条有效样本"
+    if has_total_engagement:
+        summary += "（总互动量口径）"
+
+    return deduped_posts, summary, all_stats, has_total_engagement, dup_count
+
+
+def prompt_data_source(config: TraceConfig) -> Tuple[List[Post], DataSource, Optional[str], List, bool]:
     print(f"\n{Fore.CYAN}{Style.BRIGHT}{'=' * 50}")
     print(f"{Fore.CYAN}{Style.BRIGHT}  数据来源选择")
     print(f"{Fore.CYAN}{Style.BRIGHT}{'=' * 50}{Style.RESET_ALL}\n")
 
-    print(f"{Fore.GREEN}  1. 从 CSV 文件导入")
-    print(f"{Fore.GREEN}  2. 从 JSON 文件导入")
-    print(f"{Fore.GREEN}  3. 使用模拟数据（默认）")
+    print(f"{Fore.GREEN}  1. 从单个 CSV 文件导入")
+    print(f"{Fore.GREEN}  2. 从单个 JSON 文件导入")
+    print(f"{Fore.GREEN}  3. 批量导入多个 CSV/JSON 文件（支持通配符/目录）")
+    print(f"{Fore.GREEN}  4. 使用模拟数据（默认）")
     print()
 
     while True:
-        choice = input(f"{Fore.YELLOW}?{Style.RESET_ALL} 请选择数据来源 (1/2/3) [3]: ").strip()
+        choice = input(f"{Fore.YELLOW}?{Style.RESET_ALL} 请选择数据来源 (1/2/3/4) [4]: ").strip()
 
-        if choice == "" or choice == "3":
+        if choice == "" or choice == "4":
             print(f"{Fore.CYAN}使用模拟数据{Style.RESET_ALL}")
             from data_generator import generate_mock_data
             posts = generate_mock_data(config, count=300)
-            return posts, DataSource.MOCK, None
+            return posts, DataSource.MOCK, None, [], False
 
-        if choice == "1":
+        if choice in ("1", "2"):
+            ext_hint = "CSV" if choice == "1" else "JSON"
             while True:
-                file_path = input(f"{Fore.YELLOW}?{Style.RESET_ALL} 请输入CSV文件路径：").strip().strip('"').strip("'")
+                file_path = input(f"{Fore.YELLOW}?{Style.RESET_ALL} 请输入{ext_hint}文件路径：").strip().strip('"').strip("'")
                 if not file_path:
                     print(f"{Fore.RED}路径不能为空{Style.RESET_ALL}")
                     continue
-                if not file_path.lower().endswith(".csv"):
+                if choice == "1" and not file_path.lower().endswith(".csv"):
                     print(f"{Fore.YELLOW}文件扩展名不是.csv，仍尝试读取？(y/n) y{Style.RESET_ALL}")
                     confirm = input().strip().lower()
                     if confirm not in ("", "y", "yes", "是"):
                         continue
-                break
-
-            print(f"{Fore.CYAN}正在读取 CSV：{file_path}{Style.RESET_ALL}")
-            posts, msg = load_csv(file_path, config)
-            print(f"{Fore.GREEN}{msg}{Style.RESET_ALL}")
-
-            if not posts:
-                print(f"{Fore.RED}没有有效数据，是否改用模拟数据？(y/n) y{Style.RESET_ALL}")
-                confirm = input().strip().lower()
-                if confirm in ("", "y", "yes", "是"):
-                    from data_generator import generate_mock_data
-                    posts = generate_mock_data(config, count=300)
-                    return posts, DataSource.MOCK, None
-                return [], DataSource.CSV, file_path
-
-            return posts, DataSource.CSV, file_path
-
-        if choice == "2":
-            while True:
-                file_path = input(f"{Fore.YELLOW}?{Style.RESET_ALL} 请输入JSON文件路径：").strip().strip('"').strip("'")
-                if not file_path:
-                    print(f"{Fore.RED}路径不能为空{Style.RESET_ALL}")
-                    continue
-                if not file_path.lower().endswith(".json"):
+                if choice == "2" and not file_path.lower().endswith(".json"):
                     print(f"{Fore.YELLOW}文件扩展名不是.json，仍尝试读取？(y/n) y{Style.RESET_ALL}")
                     confirm = input().strip().lower()
                     if confirm not in ("", "y", "yes", "是"):
                         continue
                 break
 
-            print(f"{Fore.CYAN}正在读取 JSON：{file_path}{Style.RESET_ALL}")
-            posts, msg = load_json(file_path, config)
+            print(f"{Fore.CYAN}正在读取 {ext_hint}：{file_path}{Style.RESET_ALL}")
+            if choice == "1":
+                posts, msg, stats = load_csv(file_path, config)
+            else:
+                posts, msg, stats = load_json(file_path, config)
             print(f"{Fore.GREEN}{msg}{Style.RESET_ALL}")
+
+            has_te = any(p.total_engagement is not None and p.total_engagement > 0 for p in posts) if posts else False
 
             if not posts:
                 print(f"{Fore.RED}没有有效数据，是否改用模拟数据？(y/n) y{Style.RESET_ALL}")
@@ -440,9 +621,61 @@ def prompt_data_source(config: TraceConfig) -> Tuple[List[Post], DataSource, Opt
                 if confirm in ("", "y", "yes", "是"):
                     from data_generator import generate_mock_data
                     posts = generate_mock_data(config, count=300)
-                    return posts, DataSource.MOCK, None
-                return [], DataSource.JSON, file_path
+                    return posts, DataSource.MOCK, None, [], False
+                return [], (DataSource.CSV if choice == "1" else DataSource.JSON), file_path, [stats], has_te
 
-            return posts, DataSource.JSON, file_path
+            ds = DataSource.CSV if choice == "1" else DataSource.JSON
+            return posts, ds, file_path, [stats], has_te
 
-        print(f"{Fore.RED}无效选择，请输入 1、2 或 3{Style.RESET_ALL}")
+        if choice == "3":
+            print(f"\n{Fore.CYAN}批量导入模式{Style.RESET_ALL}")
+            print(f"{Fore.LIGHTBLACK_EX}  支持输入：")
+            print(f"{Fore.LIGHTBLACK_EX}    · 多个文件路径，用逗号分隔")
+            print(f"{Fore.LIGHTBLACK_EX}    · 通配符：如 data/*.csv")
+            print(f"{Fore.LIGHTBLACK_EX}    · 目录路径：自动读取目录下所有 CSV/JSON")
+            print()
+
+            while True:
+                raw_input = input(f"{Fore.YELLOW}?{Style.RESET_ALL} 请输入文件路径/通配符/目录：").strip()
+                if not raw_input:
+                    print(f"{Fore.RED}输入不能为空{Style.RESET_ALL}")
+                    continue
+
+                parts = [p.strip() for p in raw_input.replace(";", ",").split(",") if p.strip()]
+                all_files: List[str] = []
+                for p in parts:
+                    expanded = _expand_file_pattern(p)
+                    all_files.extend(expanded)
+
+                all_files = [f for f in all_files if os.path.isfile(f)]
+                all_files = list(dict.fromkeys(all_files))
+
+                if not all_files:
+                    print(f"{Fore.RED}未找到任何有效文件，请重新输入{Style.RESET_ALL}")
+                    continue
+
+                print(f"{Fore.GREEN}找到 {len(all_files)} 个文件：{Style.RESET_ALL}")
+                for f in all_files[:10]:
+                    print(f"  {Fore.LIGHTBLACK_EX}- {f}{Style.RESET_ALL}")
+                if len(all_files) > 10:
+                    print(f"  {Fore.LIGHTBLACK_EX}  ... 还有 {len(all_files) - 10} 个{Style.RESET_ALL}")
+
+                confirm = input(f"{Fore.YELLOW}?{Style.RESET_ALL} 确认导入这些文件？(y/n) y：").strip().lower()
+                if confirm in ("", "y", "yes", "是"):
+                    break
+
+            posts, summary, stats_list, has_te, dup_count = load_batch_files(all_files, config)
+
+            if not posts:
+                print(f"{Fore.RED}没有有效数据，是否改用模拟数据？(y/n) y{Style.RESET_ALL}")
+                confirm = input().strip().lower()
+                if confirm in ("", "y", "yes", "是"):
+                    from data_generator import generate_mock_data
+                    posts = generate_mock_data(config, count=300)
+                    return posts, DataSource.MOCK, None, [], False
+                return posts, DataSource.CSV, f"批量({len(all_files)}文件)", stats_list, has_te
+
+            source_file = f"批量导入 {len(all_files)} 个文件"
+            return posts, DataSource.CSV, source_file, stats_list, has_te
+
+        print(f"{Fore.RED}无效选择，请输入 1、2、3 或 4{Style.RESET_ALL}")
